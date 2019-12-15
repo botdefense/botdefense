@@ -110,14 +110,22 @@ def consider_action(post, submission_id, link):
     sub = str(post.subreddit)
     author = str(post.author)
     if sub in SUBREDDIT_LIST:
-        is_proof_flaired = False
         logging.info("subreddit hit /u/{} in /r/{}".format(author, sub))
+
+        is_friended = False
+        if is_friend(author):
+            is_friended = True
+            logging.info("/u/{} confirmed to be on friends list".format(author))
+        else:
+            logging.error("/u/{} is not on friends list".format(author))
+
+        is_proof_flaired = False
         try:
             if str(post.author_flair_css_class).endswith("proof"):
                 is_proof_flaired = True
                 logging.info("/u/{} is whitelisted via flair class in /r/{}".format(author, sub))
         except:
-            logging.error("error determining flair class for /u/{} in /r/{}".format(author, sub))
+            logging.error("error checking flair class for /u/{} in /r/{}".format(author, sub))
 
         is_contributor = False
         try:
@@ -126,14 +134,50 @@ def consider_action(post, submission_id, link):
                 logging.info("/u/{} is whitelisted via approved users in /r/{}".format(author, sub))
         except:
             logging.error("error checking approved users for /u/{} in /r/{}".format(author, sub))
-        if not is_proof_flaired and not is_contributor:
+            # fail safe
+            try:
+                for moderator in r.subreddit(sub).moderator("BotDefense"):
+                    for permission in moderator.mod_permissions:
+                        if permission in ["all", "access"]:
+                            is_contributor = True
+                            logging.error("failing safe for /u/{} in /r/{}".format(author, sub))
+            except:
+                is_contributor = True
+                logging.error("error checking moderator permissions, failing safe for /u/{} in /r/{}".format(author, sub))
+
+        is_moderator = False
+        try:
+            for moderator in r.subreddit(sub).moderator(author):
+                is_moderator = True
+                logging.info("/u/{} is whitelisted via moderator list in /r/{}".format(author, sub))
+        except:
+            # fail safe
+            is_moderator = True
+            logging.error("error checking moderator list, failing safe for /u/{} in /r/{}".format(author, sub))
+
+        if is_friended and not is_proof_flaired and not is_contributor and not is_moderator:
+            ban(author, sub, link)
             try:
                 if not (post.removed or post.spam):
                     logging.info("removing " + link)
                     post.mod.remove(spam=True)
-                    ban(author, sub, link)
-            except:
-                logging.error("error removing and banning /u/{} in /r/{}".format(author, sub))
+            except Exception as e:
+                logging.error("error removing {}: {}".format(link, e))
+
+
+def is_friend(user):
+    try:
+        if type(user) is str:
+            return r.redditor(user).is_friend
+        else:
+            return user.is_friend
+    except Exception as e:
+        logging.error("exception checking friend status for /u/{}: {}".format(user, e))
+    try:
+        return r.get("/api/v1/me/friends/" + str(user)) == str(user)
+    except Exception as e:
+        logging.error("failed checking friend status for /u/{}: {}".format(user, e))
+    return False
 
 
 def ban(author, sub, link):
@@ -302,7 +346,6 @@ def check_mail():
         # some other type of subreddit message
         else:
             message.mark_read()
-            message.reply("Please modmail /r/BotDefense from your account if you would like to get in touch.")
 
 
 def join_subreddit(subreddit):
