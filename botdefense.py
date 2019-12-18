@@ -13,11 +13,13 @@ import logging
 SUBREDDIT_LIST = []
 COMMENT_IDS = []
 SUBMISSION_IDS = []
+QUEUE_IDS = []
 LOG_IDS = []
 FREQUENCY = {
     "load_subreddits": 3600,
     "check_comments": 5,
     "check_submissions": 30,
+    "check_queue": 60,
     "check_mail": 120,
     "check_contributions": 60,
     "sync_friends": 300,
@@ -77,7 +79,7 @@ def check_comments():
         if str(comment.id) in COMMENT_IDS:
             continue
         link = "https://www.reddit.com/comments/{}/_/{}".format(comment.submission.id, comment.id)
-        consider_action(comment, str(comment.submission.id), link)
+        consider_action(comment, link)
         # we only cache identifiers after processing successfully
         COMMENT_IDS.append(str(comment.id))
 
@@ -97,7 +99,7 @@ def check_submissions():
         if str(submission.id) in SUBMISSION_IDS:
             continue
         link = "https://www.reddit.com/comments/" + str(submission.id)
-        consider_action(submission, str(submission.id), link)
+        consider_action(submission, link)
         # we only cache identifiers after processing successfully
         SUBMISSION_IDS.append(str(submission.id))
 
@@ -106,7 +108,30 @@ def check_submissions():
         SUBMISSION_IDS = SUBMISSION_IDS[100:]
 
 
-def consider_action(post, submission_id, link):
+def check_queue():
+    global QUEUE_IDS
+
+    if not ready("check_queue"):
+        return
+
+    logging.info("checking queue")
+    friends = r.user.friends()
+    for submission in r.subreddit("mod").mod.modqueue(limit=100, only="submissions"):
+        if str(submission.id) in QUEUE_IDS:
+            continue
+        if submission.author in friends:
+            link = "https://www.reddit.com/comments/" + str(submission.id)
+            logging.info("queue hit for /u/{} in /r/{} at {}".format(submission.author, submission.subreddit, link))
+            consider_action(submission, link)
+        # we only cache identifiers after processing successfully
+        QUEUE_IDS.append(str(submission.id))
+
+    # trim cache
+    if len(QUEUE_IDS) > 200:
+        QUEUE_IDS = QUEUE_IDS[100:]
+
+
+def consider_action(post, link):
     sub = str(post.subreddit)
     author = str(post.author)
     if sub in SUBREDDIT_LIST:
@@ -424,6 +449,7 @@ def run():
     load_subreddits()
     check_comments()
     check_submissions()
+    check_queue()
     check_mail()
     check_contributions()
     sync_friends()
