@@ -192,17 +192,17 @@ def consider_action(post, link):
 
 def is_friend(user):
     try:
-        if type(user) is str:
+        if type(user) == str:
             return r.redditor(user).is_friend
         else:
             return user.is_friend
     except Exception as e:
-        logging.error("exception checking friend status for /u/{}: {}".format(user, e))
+        logging.info("exception checking friend status for /u/{}: {}".format(user, e))
     try:
         return r.get("/api/v1/me/friends/" + str(user)) == str(user)
     except Exception as e:
         logging.error("failed checking friend status for /u/{}: {}".format(user, e))
-    return False
+    return None
 
 
 def ban(author, sub, link):
@@ -339,7 +339,7 @@ def check_mail():
         sub = message.subreddit.display_name
 
         # looks like an invite
-        if re.search("^invitation to moderate /r/\w+$", str(message.subject)):
+        if re.search("^invitation to moderate /?(r|u|user)/[\w-]+$", str(message.subject)):
             logging.info("invited to moderate /r/{}".format(sub))
             result = None
             reason = None
@@ -363,7 +363,7 @@ def check_mail():
                         " If you believe this was sent in error, please modmail /r/BotDefense."
                     )
         # looks like a removal
-        elif re.search("^/?u/[\w-]+ has been removed as a moderator from /?r/\w+$", str(message.subject)):
+        elif re.search("^/?u/[\w-]+ has been removed as a moderator from /?(r|u|user)/[\w-]+$", str(message.subject)):
             message.mark_read()
             load_subreddits(force=True)
             if sub not in SUBREDDIT_LIST:
@@ -376,7 +376,7 @@ def check_mail():
 def join_subreddit(subreddit):
     if subreddit.quarantine:
         return False, "quarantined"
-    elif subreddit.subreddit_type not in ["public", "restricted", "gold_only"]:
+    elif subreddit.subreddit_type not in ["public", "restricted", "gold_only", "user"]:
         return False, subreddit.subreddit_type
 
     try:
@@ -396,53 +396,43 @@ def sync_friends():
 
     logging.info("syncing friends")
     try:
-        checked_submissions = []
-        identifier = None
         for log in r.subreddit("BotDefense").mod.log(action="editflair", limit=100):
             # only log ids can be persistently cached, not submission ids
             if str(log.id) in LOG_IDS:
                 continue
-            if log.target_fullname and log.target_fullname.startswith("t3_"):
-                identifier = log.target_fullname[3:]
-                submission = r.submission(id=identifier)
-                account = ""
-                if identifier in checked_submissions:
-                    continue
-                if submission.author != "BotDefense":
-                    continue
-                if submission.url:
-                    m = re.search("/(?:u|user)/([\w-]+)", submission.url)
-                    if m:
-                        account = m.group(1)
-                if (
-                        account
-                        and len(account) > 0
-                        and submission.link_flair_text
-                        and len(submission.link_flair_text) > 0
-                ):
-                    user = r.redditor(account)
-                    # only ban if banned
-                    if submission.link_flair_text == "banned":
-                        if not user.is_friend:
-                            logging.info("adding friend " + account)
-                            user.friend()
-                    # only unban if not pending and user is friended
-                    elif submission.link_flair_text != "pending":
-                        if user.is_friend:
-                            logging.info("removing friend " + account)
-                            user.unfriend()
-                            unban(account)
-            # avoid checking the same submissions within a single invocation
-            if identifier:
-                SUBMISSION_IDS.append(identifier)
-            # we only cache log identifiers after processing successfully
-            LOG_IDS.append(str(log.id))
+            try:
+                if log.target_author == "BotDefense" and log.target_fullname.startswith("t3_"):
+                    submission = r.submission(id=log.target_fullname[3:])
+                    sync_submission(submission)
+                # we only cache log identifiers after processing successfully
+                LOG_IDS.append(str(log.id))
+            except Exception as e:
+                logging.info("exception processing log {}: ".format(log.id, e))
     except Exception as e:
-        logging.info("exception adding friend: " + str(e))
+        logging.info("exception syncing friends: " + str(e))
 
     # trim cache
     if len(LOG_IDS) > 200:
         LOG_IDS = LOG_IDS[100:]
+
+
+def sync_submission(submission):
+    account = None
+    if submission.url:
+        m = re.search("/(?:u|user)/([\w-]+)", submission.url)
+        if m:
+            account = str(m.group(1))
+    if account and submission.link_flair_text != "pending":
+        is_friended = is_friend(account)
+        if is_friended is None:
+            logging.info("skipping " + account)
+        elif is_friended is False and submission.link_flair_text == "banned":
+            logging.info("adding friend " + account)
+            r.redditor(account).friend()
+        elif is_friended and submission.link_flair_text != "banned":
+            logging.info("removing friend " + account)
+            r.redditor(account).unfriend()
+            unban(account)
 
 
 def run():
