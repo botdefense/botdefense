@@ -240,7 +240,7 @@ def unban(account):
                         note = ban.note
                         if not note or len(note) == 0:
                             note = "[empty]"
-                            logging.info("not unbanning /u/{} on /r/{} ({})".format(account, subreddit, note))
+                        logging.debug("not unbanning /u/{} on /r/{} ({})".format(account, subreddit, note))
                 except Exception as e:
                     logging.error("exception unbanning /u/{} on /r/{}".format(account, subreddit))
         except:
