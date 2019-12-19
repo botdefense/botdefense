@@ -1,11 +1,9 @@
 #!/usr/bin/python
 
 import praw
-import requests
 import time
 from datetime import datetime
 import re
-import random
 import logging
 
 
