@@ -132,60 +132,63 @@ def check_queue():
 def consider_action(post, link):
     sub = str(post.subreddit)
     author = str(post.author)
-    if sub in SUBREDDIT_LIST:
-        logging.info("subreddit hit /u/{} in /r/{}".format(author, sub))
 
-        is_friended = False
-        if is_friend(author):
-            is_friended = True
-            logging.info("/u/{} confirmed to be on friends list".format(author))
-        else:
-            logging.error("/u/{} is not on friends list".format(author))
+    if sub not in SUBREDDIT_LIST:
+        return
 
-        is_proof_flaired = False
+    logging.info("subreddit hit /u/{} in /r/{}".format(author, sub))
+
+    is_friended = False
+    if is_friend(author):
+        is_friended = True
+        logging.info("/u/{} confirmed to be on friends list".format(author))
+    else:
+        logging.error("/u/{} is not on friends list".format(author))
+
+    is_proof_flaired = False
+    try:
+        if str(post.author_flair_css_class).endswith("proof"):
+            is_proof_flaired = True
+            logging.info("/u/{} is whitelisted via flair class in /r/{}".format(author, sub))
+    except:
+        logging.error("error checking flair class for /u/{} in /r/{}".format(author, sub))
+
+    is_contributor = False
+    try:
+        for contributor in r.subreddit(sub).contributor(author):
+            is_contributor = True
+            logging.info("/u/{} is whitelisted via approved users in /r/{}".format(author, sub))
+    except:
+        logging.error("error checking approved users for /u/{} in /r/{}".format(author, sub))
+        # fail safe
         try:
-            if str(post.author_flair_css_class).endswith("proof"):
-                is_proof_flaired = True
-                logging.info("/u/{} is whitelisted via flair class in /r/{}".format(author, sub))
+            for moderator in r.subreddit(sub).moderator("BotDefense"):
+                for permission in moderator.mod_permissions:
+                    if permission in ["all", "access"]:
+                        is_contributor = True
+                        logging.error("failing safe for /u/{} in /r/{}".format(author, sub))
         except:
-            logging.error("error checking flair class for /u/{} in /r/{}".format(author, sub))
+            is_contributor = True
+            logging.error("error checking moderator permissions, failing safe for /u/{} in /r/{}".format(author, sub))
 
-        is_contributor = False
-        try:
-            for contributor in r.subreddit(sub).contributor(author):
-                is_contributor = True
-                logging.info("/u/{} is whitelisted via approved users in /r/{}".format(author, sub))
-        except:
-            logging.error("error checking approved users for /u/{} in /r/{}".format(author, sub))
-            # fail safe
-            try:
-                for moderator in r.subreddit(sub).moderator("BotDefense"):
-                    for permission in moderator.mod_permissions:
-                        if permission in ["all", "access"]:
-                            is_contributor = True
-                            logging.error("failing safe for /u/{} in /r/{}".format(author, sub))
-            except:
-                is_contributor = True
-                logging.error("error checking moderator permissions, failing safe for /u/{} in /r/{}".format(author, sub))
-
-        is_moderator = False
-        try:
-            for moderator in r.subreddit(sub).moderator(author):
-                is_moderator = True
-                logging.info("/u/{} is whitelisted via moderator list in /r/{}".format(author, sub))
-        except:
-            # fail safe
+    is_moderator = False
+    try:
+        for moderator in r.subreddit(sub).moderator(author):
             is_moderator = True
-            logging.error("error checking moderator list, failing safe for /u/{} in /r/{}".format(author, sub))
+            logging.info("/u/{} is whitelisted via moderator list in /r/{}".format(author, sub))
+    except:
+        # fail safe
+        is_moderator = True
+        logging.error("error checking moderator list, failing safe for /u/{} in /r/{}".format(author, sub))
 
-        if is_friended and not is_proof_flaired and not is_contributor and not is_moderator:
-            ban(author, sub, link)
-            try:
-                if not (post.removed or post.spam):
-                    logging.info("removing " + link)
-                    post.mod.remove(spam=True)
-            except Exception as e:
-                logging.error("error removing {}: {}".format(link, e))
+    if is_friended and not is_proof_flaired and not is_contributor and not is_moderator:
+        ban(author, sub, link)
+        try:
+            if not (post.removed or post.spam):
+                logging.info("removing " + link)
+                post.mod.remove(spam=True)
+        except Exception as e:
+            logging.error("error removing {}: {}".format(link, e))
 
 
 def is_friend(user):
