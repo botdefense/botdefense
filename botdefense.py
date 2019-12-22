@@ -138,6 +138,12 @@ def consider_action(post, link):
 
     logging.info("subreddit hit /u/{} in /r/{}".format(author, sub))
 
+    permissions = []
+    try:
+        permissions = post.subreddit.moderator("BotDefense")[0].mod_permissions
+    except Exception as e:
+        logging.error("error checking moderator permissions in /r/{}: {}".format(sub, e))
+
     is_friended = False
     if is_friend(author):
         is_friended = True
@@ -150,45 +156,41 @@ def consider_action(post, link):
         if str(post.author_flair_css_class).endswith("proof"):
             is_proof_flaired = True
             logging.info("/u/{} is whitelisted via flair class in /r/{}".format(author, sub))
-    except:
-        logging.error("error checking flair class for /u/{} in /r/{}".format(author, sub))
+    except Exception as e:
+        logging.error("error checking flair class for /u/{} in /r/{}: {}".format(author, sub, e))
 
     is_contributor = False
     try:
-        for contributor in r.subreddit(sub).contributor(author):
+        for contributor in post.subreddit.contributor(author):
             is_contributor = True
             logging.info("/u/{} is whitelisted via approved users in /r/{}".format(author, sub))
-    except:
-        logging.error("error checking approved users for /u/{} in /r/{}".format(author, sub))
+    except Exception as e:
+        logging.warning("unable to check approved users for /u/{} in /r/{}: {}".format(author, sub, e))
         # fail safe
-        try:
-            for moderator in r.subreddit(sub).moderator("BotDefense"):
-                for permission in moderator.mod_permissions:
-                    if permission in ["all", "access"]:
-                        is_contributor = True
-                        logging.error("failing safe for /u/{} in /r/{}".format(author, sub))
-        except:
+        if not permissions or "access" in permissions or "all" in permissions:
             is_contributor = True
-            logging.error("error checking moderator permissions, failing safe for /u/{} in /r/{}".format(author, sub))
+            logging.error("failing safe for /u/{} in /r/{}".format(author, sub))
 
     is_moderator = False
     try:
-        for moderator in r.subreddit(sub).moderator(author):
+        if post.subreddit.moderator(author):
             is_moderator = True
             logging.info("/u/{} is whitelisted via moderator list in /r/{}".format(author, sub))
-    except:
+    except Exception as e:
         # fail safe
         is_moderator = True
-        logging.error("error checking moderator list, failing safe for /u/{} in /r/{}".format(author, sub))
+        logging.error("error checking moderator list, failing safe for /u/{} in /r/{}: {}".format(author, sub, e))
 
     if is_friended and not is_proof_flaired and not is_contributor and not is_moderator:
-        ban(author, sub, link)
-        try:
-            if not (post.removed or post.spam):
-                logging.info("removing " + link)
-                post.mod.remove(spam=True)
-        except Exception as e:
-            logging.error("error removing {}: {}".format(link, e))
+        if "access" in permissions or "all" in permissions:
+            ban(author, sub, link, ("mail" in permissions))
+        if "posts" in permissions or "all" in permissions:
+            try:
+                if not (post.removed or post.spam):
+                    logging.info("removing " + link)
+                    post.mod.remove(spam=True)
+            except Exception as e:
+                logging.error("error removing {}: {}".format(link, e))
 
 
 def is_friend(user):
@@ -206,11 +208,11 @@ def is_friend(user):
     return None
 
 
-def ban(author, sub, link):
+def ban(author, sub, link, mute):
     already_banned = False
     logging.info("banning /u/{} in /r/{}".format(author, sub))
     try:
-        for banned in r.subreddit(sub).banned(author):
+        for ban in r.subreddit(sub).banned(author):
             logging.info("/u/{} already banned in /r/{}".format(author, sub))
             already_banned = True
     except Exception as e:
@@ -222,11 +224,9 @@ def ban(author, sub, link):
                 author, ban_message=BAN_TEMPLATE.format(sub, author, sub),
                 note="/u/{} banned by /u/BotDefense at {} for {}".format(author, date, link))
             logging.info("banned /u/{} in /r/{}".format(author, sub))
-            for moderator in r.subreddit(sub).moderator("BotDefense"):
-                for permission in moderator.mod_permissions:
-                    if permission == "mail":
-                        logging.info("muting /u/{} in /r/{}".format(author, sub))
-                        r.subreddit(sub).muted.add(author)
+            if mute:
+                logging.info("muting /u/{} in /r/{}".format(author, sub))
+                r.subreddit(sub).muted.add(author)
         except Exception as e:
             logging.error("error banning /u/{}: {}".format(author, e))
 
@@ -248,7 +248,7 @@ def unban(account):
                     logging.error("exception unbanning /u/{} on /r/{}".format(account, subreddit))
         except:
             # we could check permissions, but this seems sufficient
-            logging.error("error checking ban for /u/{} on /r/{}".format(account, subreddit))
+            logging.warning("unable to check ban for /u/{} on /r/{}".format(account, subreddit))
 
 
 def check_contributions():
