@@ -165,7 +165,7 @@ def consider_action(post, link):
             is_contributor = True
             logging.info("/u/{} is whitelisted via approved users in /r/{}".format(author, sub))
     except Exception as e:
-        logging.warning("unable to check approved users for /u/{} in /r/{}: {}".format(author, sub, e))
+        logging.info("unable to check approved users for /u/{} in /r/{}: {}".format(author, sub, e))
         # fail safe
         if not permissions or "access" in permissions or "all" in permissions:
             is_contributor = True
