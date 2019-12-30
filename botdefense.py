@@ -200,11 +200,15 @@ def is_friend(user):
         else:
             return user.is_friend
     except Exception as e:
-        logging.info("exception checking friend status for /u/{}: {}".format(user, e))
+        logging.info("exception checking is_friend for /u/{}: {}".format(user, e))
     try:
         return r.get("/api/v1/me/friends/" + str(user)) == str(user)
     except Exception as e:
-        logging.error("failed checking friend status for /u/{}: {}".format(user, e))
+        logging.info("exception checking friends for /u/{}: {}".format(user, e))
+    try:
+        return user in r.user.friends()
+    except Exception as e:
+        logging.error("failed searching friends for /u/{}: {}".format(user, e))
     return None
 
 
@@ -262,7 +266,7 @@ def check_contributions():
 
         # non-conforming posts are removed by AutoModerator so just skip them
         account = ""
-        fresh = True
+        repost = False
         post = None
         if submission.url:
             m = re.search(
@@ -284,11 +288,11 @@ def check_contributions():
                     for query in "url:" + url, "title" + name:
                         for similar in r.subreddit("BotDefense").search(query):
                             if similar.title == title and similar.author == "BotDefense":
-                                fresh = False
+                                repost = True
                                 break
-                        if not fresh:
+                        if repost:
                             break
-                    if fresh:
+                    if not repost:
                         post = r.subreddit("BotDefense").submit(title, url=url)
                         post.disable_inbox_replies()
 
@@ -299,15 +303,15 @@ def check_contributions():
             submission.mod.remove()
             comment = submission.reply("Thank you for your submission!")
             comment.mod.distinguish()
-            logging.info("contribution accepted for " + name)
-        elif not fresh:
+            logging.info("contribution {} accepted for {}".format(submission.permalink, name))
+        elif repost:
             submission.mod.remove()
             comment = submission.reply(
                 "Thank you for your submission! It looks like we already have an"
                 " entry for that account!"
             )
             comment.mod.distinguish()
-            logging.info("contribution duplicate for " + name)
+            logging.info("contribution {} duplicate for {}".format(submission.permalink, name))
         elif account and len(account) > 0:
             submission.mod.remove()
             comment = submission.reply(
@@ -316,7 +320,7 @@ def check_contributions():
                 " but please send modmail if you believe this was an error."
             )
             comment.mod.distinguish()
-            logging.info("contribution rejected for " + name)
+            logging.info("contribution {} rejected".format(submission.permalink))
 
 
 def check_mail():
