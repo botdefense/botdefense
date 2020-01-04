@@ -200,11 +200,11 @@ def is_friend(user):
         else:
             return user.is_friend
     except Exception as e:
-        logging.info("exception checking is_friend for /u/{}: {}".format(user, e))
+        logging.debug("exception checking is_friend for /u/{}: {}".format(user, e))
     try:
         return r.get("/api/v1/me/friends/" + str(user)) == str(user)
     except Exception as e:
-        logging.info("exception checking friends for /u/{}: {}".format(user, e))
+        logging.debug("exception checking friends for /u/{}: {}".format(user, e))
     try:
         return user in r.user.friends()
     except Exception as e:
@@ -270,7 +270,7 @@ def check_contributions():
         post = None
         if submission.url:
             m = re.search(
-                "^https?://\w+\.reddit\.com/(?:u|user)/([\w-]+)", submission.url
+                "^https?://(?:\w+\.)?reddit\.com/(?:u|user)/([\w-]+)", submission.url
             )
             if m:
                 account = m.group(1)
@@ -292,6 +292,13 @@ def check_contributions():
                                 break
                         if repost:
                             break
+                    if not repost:
+                        for recent in r.subreddit("BotDefense").new(limit=1000):
+                            if recent.title == title and recent.author == "BotDefense":
+                                repost = True
+                                break
+                            if recent.created_utc < time.time() - 604800:
+                                break
                     if not repost:
                         post = r.subreddit("BotDefense").submit(title, url=url)
                         post.disable_inbox_replies()
