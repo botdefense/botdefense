@@ -8,12 +8,14 @@ import logging
 
 
 # global data
+STATUS_POST = None
 SUBREDDIT_LIST = []
 COMMENT_IDS = []
 SUBMISSION_IDS = []
 QUEUE_IDS = []
 LOG_IDS = []
 FREQUENCY = {
+    "update_status": 300,
     "load_subreddits": 3600,
     "check_comments": 5,
     "check_submissions": 30,
@@ -49,6 +51,70 @@ def ready(key, force=False):
         LAST[key] = time.time()
         return 1
     return 0
+
+
+def absolute_time(when):
+    return datetime.fromtimestamp(when).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def relative_time(when):
+    delta = time.time() - when
+
+    if delta < 60:
+        return "just now"
+    if delta < 120:
+        return "a minute ago"
+    if delta < 3600:
+        return str(int(delta / 60)) + " minutes ago"
+    if delta < 7200:
+        return "an hour ago"
+    return str(int(delta / 3600)) + " hours ago"
+
+
+def update_status():
+    global STATUS_POST
+
+    if not ready("update_status"):
+        return
+
+    logging.info("updating status")
+
+    if not STATUS_POST:
+        for result in r.subreddit("BotDefense").search('title:"BotDefense status"', sort='new'):
+            if result.author == "BotDefense" and result.is_self:
+                STATUS_POST = result
+                break
+        if not STATUS_POST:
+            logging.error("unable to locate status post")
+            return
+
+    last_time = None
+    last_type = None
+    recent_logs = ""
+    try:
+        current_time = absolute_time(time.time())
+        for log in r.subreddit("mod").mod.log(mod="BotDefense", limit=500):
+            if not last_time:
+                last_time = absolute_time(log.created_utc)
+                last_type = log.action
+            if log.created_utc < time.time() - 86400:
+                break
+            if log.action in ["banuser", "spamcomment"]:
+                recent_logs += "|{}|{}|/u/{}|\n".format(relative_time(log.created_utc), log.action, log.target_author)
+
+        if recent_logs:
+            recent_logs = "|Time|Action|Account|\n|-|-|-|\n" + recent_logs
+        STATUS_POST.edit("|Attribute|Value|\n"
+                         "|-|-|\n"
+                         "|Current time|{}|\n"
+                         "|Last action time|{}|\n"
+                         "|Last action type|{}|\n"
+                         "\n&nbsp;\n&nbsp;\n\n{}"
+                         .format(current_time,
+                                 last_time,
+                                 last_type,
+                                 recent_logs))
+    except Exception as e:
+        logging.error("unable to update status: {}".format(e))
 
 
 def load_subreddits(force=False):
@@ -448,6 +514,7 @@ def sync_submission(submission):
 
 
 def run():
+    update_status()
     load_subreddits()
     check_comments()
     check_submissions()
