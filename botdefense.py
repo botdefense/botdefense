@@ -56,6 +56,7 @@ def ready(key, force=False):
 def absolute_time(when):
     return datetime.fromtimestamp(when).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+
 def relative_time(when):
     delta = time.time() - when
 
@@ -77,7 +78,6 @@ def update_status():
         return
 
     logging.info("updating status")
-
     if not STATUS_POST:
         for result in r.subreddit("BotDefense").search('title:"BotDefense status"', sort='new'):
             if result.author == "BotDefense" and result.is_self:
@@ -311,7 +311,7 @@ def unban(account):
                         r.subreddit(subreddit).banned.remove(account)
                     else:
                         note = ban.note
-                        if not note or len(note) == 0:
+                        if not note:
                             note = "[empty]"
                         logging.debug("not unbanning /u/{} on /r/{} ({})".format(account, subreddit, note))
                 except Exception as e:
@@ -330,70 +330,78 @@ def check_contributions():
         if submission.author == "BotDefense":
             continue
 
-        # non-conforming posts are removed by AutoModerator so just skip them
-        account = ""
-        repost = False
+        account = None
+        name = None
+        canonical = None
         post = None
+
         if submission.url:
-            m = re.search(
-                "^https?://(?:\w+\.)?reddit\.com/(?:u|user)/([\w-]+)", submission.url
-            )
+            m = re.search("^https?://(?:\w+\.)?reddit\.com/(?:u|user)/([\w-]+)", submission.url)
             if m:
                 account = m.group(1)
 
-        if account and len(account) > 0:
-            try:
-                user = r.redditor(name=account)
-                user_data = r.get(
-                    "/api/user_data_by_account_ids", {"ids": user.fullname}
-                )
-                name = user_data[user.fullname]["name"]
-                if name and len(name) > 0:
-                    title = "overview for " + name
-                    url = "https://www.reddit.com/user/" + name
-                    for query in "url:" + url, "title" + name:
-                        for similar in r.subreddit("BotDefense").search(query):
-                            if similar.title == title and similar.author == "BotDefense":
-                                repost = True
-                                break
-                        if repost:
-                            break
-                    if not repost:
-                        for recent in r.subreddit("BotDefense").new(limit=1000):
-                            if recent.title == title and recent.author == "BotDefense":
-                                repost = True
-                                break
-                            if recent.created_utc < time.time() - 604800:
-                                break
-                    if not repost:
-                        post = r.subreddit("BotDefense").submit(title, url=url)
-                        post.disable_inbox_replies()
+        # non-conforming posts are removed by AutoModerator so just skip them
+        if not account:
+            continue
 
-            except Exception as e:
-                logging.error("exception creating canonical post: " + str(e))
+        try:
+            user = r.redditor(name=account)
+            user_data = r.get(
+                "/api/user_data_by_account_ids", {"ids": user.fullname}
+            )
+            name = user_data[user.fullname]["name"]
+        except Exception as e:
+            logging.debug("exception checking account {}: ".format(account, e))
 
-        if post:
+        if not name:
             submission.mod.remove()
-            comment = submission.reply("Thank you for your submission!")
-            comment.mod.distinguish()
-            logging.info("contribution {} accepted for {}".format(submission.permalink, name))
-        elif repost:
-            submission.mod.remove()
-            comment = submission.reply(
-                "Thank you for your submission! It looks like we already have an"
-                " entry for that account!"
-            )
-            comment.mod.distinguish()
-            logging.info("contribution {} duplicate for {}".format(submission.permalink, name))
-        elif account and len(account) > 0:
-            submission.mod.remove()
-            comment = submission.reply(
-                "Thank you for your submission! That account does not appear to"
-                " exist (perhaps it has already been suspended, banned, or deleted),"
-                " but please send modmail if you believe this was an error."
-            )
+            comment = submission.reply("Thank you for your submission! That account does not appear to"
+                                       " exist (perhaps it has already been suspended, banned, or deleted),"
+                                       " but please send modmail if you believe this was an error.")
             comment.mod.distinguish()
             logging.info("contribution {} rejected".format(submission.permalink))
+            continue
+
+        title = "overview for " + name
+        url = "https://www.reddit.com/user/" + name
+        try:
+            for query in "url:\"{}\"".format(url), "title:\"{}\"".format(name):
+                for similar in r.subreddit("BotDefense").search(query):
+                    if similar.title == title and similar.author == "BotDefense":
+                        canonical = similar
+                        break
+                if canonical:
+                    break
+            if not canonical:
+                for recent in r.subreddit("BotDefense").new(limit=1000):
+                    if recent.title == title and recent.author == "BotDefense":
+                        canonical = recent
+                        break
+                    if recent.created_utc < time.time() - 604800:
+                        break
+            if not canonical:
+                post = r.subreddit("BotDefense").submit(title, url=url)
+                post.disable_inbox_replies()
+        except Exception as e:
+            logging.error("exception creating canonical post: ".format(e))
+
+        submission.mod.remove()
+        if post:
+            comment = submission.reply("Thank you for your submission! We have created a new"
+                                       " [entry for this account]({}).".format(post.permalink))
+            comment.mod.distinguish()
+            logging.info("contribution {} accepted for {}".format(submission.permalink, name))
+        elif canonical:
+            comment = submission.reply("Thank you for your submission! It looks like we already have"
+                                       " an [entry for this account]({}).".format(canonical.permalink))
+            comment.mod.distinguish()
+            logging.info("contribution {} duplicate for {}".format(submission.permalink, name))
+        else:
+            comment = submission.reply("Thank you for your submission!")
+            comment.mod.distinguish()
+            logging.error("contribution {} error".format(submission.permalink))
+            r.subreddit("BotDefense").message("Error processing contribution",
+                                              "{}".format(submission.permalink))
 
 
 def check_mail():
@@ -466,6 +474,7 @@ def join_subreddit(subreddit):
     else:
         return True, None
 
+
 def sync_friends():
     global LOG_IDS
 
@@ -487,7 +496,7 @@ def sync_friends():
             except Exception as e:
                 logging.info("exception processing log {}: ".format(log.id, e))
     except Exception as e:
-        logging.info("exception syncing friends: " + str(e))
+        logging.info("exception syncing friends: ".format(e))
 
     # trim cache
     if len(LOG_IDS) > 200:
@@ -533,5 +542,6 @@ if __name__ == "__main__":
             logging.error("received SIGINT from keyboard, stopping")
             exit(1)
         except Exception as e:
-            logging.error("site error: " + str(e))
-            time.sleep(300)
+            logging.error("site error: ".format(e))
+            time.sleep(60)
+            exit(1)
