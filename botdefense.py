@@ -203,7 +203,6 @@ def consider_action(post, link):
         return
 
     logging.info("subreddit hit /u/{} in /r/{}".format(author, sub))
-
     permissions = []
     try:
         permissions = post.subreddit.moderator("BotDefense")[0].mod_permissions
@@ -383,7 +382,7 @@ def check_contributions():
                 post = r.subreddit("BotDefense").submit(title, url=url)
                 post.disable_inbox_replies()
         except Exception as e:
-            logging.error("exception creating canonical post: ".format(e))
+            logging.error("exception creating canonical post: {}".format(e))
 
         submission.mod.remove()
         if post:
@@ -496,7 +495,7 @@ def sync_friends():
             except Exception as e:
                 logging.info("exception processing log {}: ".format(log.id, e))
     except Exception as e:
-        logging.info("exception syncing friends: ".format(e))
+        logging.info("exception syncing friends: {}".format(e))
 
     # trim cache
     if len(LOG_IDS) > 200:
@@ -542,6 +541,6 @@ if __name__ == "__main__":
             logging.error("received SIGINT from keyboard, stopping")
             exit(1)
         except Exception as e:
-            logging.error("site error: ".format(e))
+            logging.error("site error: {}".format(e))
             time.sleep(60)
             exit(1)
