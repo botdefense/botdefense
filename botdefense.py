@@ -15,6 +15,7 @@ SUBMISSION_IDS = []
 QUEUE_IDS = []
 LOG_IDS = []
 FREQUENCY = {
+    "kill_switch": 60,
     "update_status": 300,
     "load_subreddits": 3600,
     "check_comments": 5,
@@ -51,6 +52,24 @@ def ready(key, force=False):
         LAST[key] = time.time()
         return 1
     return 0
+
+
+def kill_switch():
+    if not ready("kill_switch"):
+        return
+
+    logging.info("checking kill switch")
+    active = False
+    while not active:
+        try:
+            if r.subreddit("BotDefense").moderator("BotDefense")[0].mod_permissions:
+                active = True
+        except Exception as e:
+            logging.error("exception checking permissions: {}".format(e))
+        if not active:
+            logging.info("kill switch activated, sleeping")
+            # sleep needs to be before any other actions to reduce the odds of spinning
+            time.sleep(60)
 
 
 def absolute_time(when):
@@ -522,6 +541,7 @@ def sync_submission(submission):
 
 
 def run():
+    kill_switch()
     update_status()
     load_subreddits()
     check_comments()
