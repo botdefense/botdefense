@@ -436,9 +436,9 @@ def check_mail():
                 continue
             # skip non-subreddit messages
             if not message.subreddit:
+                message.mark_read()
                 if message.distinguished != "admin":
                     message.reply("Please modmail /r/BotDefense if you would like to get in touch.")
-                message.mark_read()
                 continue
 
             sub = message.subreddit.display_name
