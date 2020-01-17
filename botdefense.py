@@ -354,7 +354,7 @@ def check_contributions():
         post = None
 
         if submission.url:
-            m = re.search("^https?://(?:\w+\.)?reddit\.com/(?:u|user)/([\w-]+)", submission.url)
+            m = re.search("^https?://(?:\w+\.)?reddit\.com/(?:u|user)/([\w-]{3,20})", submission.url)
             if m:
                 account = m.group(1)
 
@@ -399,6 +399,7 @@ def check_contributions():
                         break
             if not canonical:
                 post = r.subreddit("BotDefense").submit(title, url=url)
+                post.report("Reviewable submission from /u/{}: please approve and update flair".format(submission.author))
                 post.disable_inbox_replies()
         except Exception as e:
             logging.error("exception creating canonical post: {}".format(e))
@@ -428,53 +429,55 @@ def check_mail():
 
     logging.info("checking mail")
     for message in r.inbox.unread(limit=10):
-        sender = str(message.author)
-
-        # skip reddit messages and non-messages
-        if sender == "reddit" or not message.fullname.startswith("t4_"):
-            message.mark_read()
-            continue
-        # skip non-subreddit messages
-        if not message.subreddit:
-            message.reply("Please modmail /r/BotDefense if you would like to get in touch.")
-            message.mark_read()
-            continue
-
-        sub = message.subreddit.display_name
-
-        # looks like an invite
-        if re.search("^invitation to moderate /?(r|u|user)/[\w-]+$", str(message.subject)):
-            logging.info("invited to moderate /r/{}".format(sub))
-            result = None
-            reason = None
-
-            try:
-                result, reason = join_subreddit(message.subreddit)
-            except:
-                reason = "error"
-
-            if result:
+        try:
+            # skip non-messages and some accounts
+            if not message.fullname.startswith("t4_") or message.author in ["mod_mailer", "reddit"]:
                 message.mark_read()
-                logging.info("joined /r/{}".format(sub))
+                continue
+            # skip non-subreddit messages
+            if not message.subreddit:
+                if message.distinguished != "admin":
+                    message.reply("Please modmail /r/BotDefense if you would like to get in touch.")
+                message.mark_read()
+                continue
+
+            sub = message.subreddit.display_name
+
+            # looks like an invite
+            if re.search("^invitation to moderate /?(r|u|user)/[\w-]+$", str(message.subject)):
+                logging.info("invited to moderate /r/{}".format(sub))
+                result = None
+                reason = None
+
+                try:
+                    result, reason = join_subreddit(message.subreddit)
+                except:
+                    reason = "error"
+
+                if result:
+                    message.mark_read()
+                    logging.info("joined /r/{}".format(sub))
+                else:
+                    message.mark_read()
+                    if reason == "error":
+                        logging.info("failure accepting invite {} from /r/{}".format(message.fullname, sub))
+                    elif reason:
+                        logging.info("declining invite from {} subreddit /r/{}".format(reason, sub))
+                        message.reply(
+                            "This bot isn't really needed on non-public subreddits due to very limited bot"
+                            " activity. If you believe this was sent in error, please modmail /r/BotDefense."
+                        )
+            # looks like a removal
+            elif re.search("^/?u/[\w-]+ has been removed as a moderator from /?(r|u|user)/[\w-]+$", str(message.subject)):
+                message.mark_read()
+                load_subreddits(force=True)
+                if sub not in SUBREDDIT_LIST:
+                    logging.info("removed as moderator from /r/" + sub)
+            # some other type of subreddit message
             else:
                 message.mark_read()
-                if reason == "error":
-                    logging.info("failure accepting invite {} from /r/{}".format(message.fullname, sub))
-                elif reason:
-                    logging.info("declining invite from {} subreddit /r/{}".format(reason, sub))
-                    message.reply(
-                        "This bot isn't really needed on non-public subreddits due to very limited bot activity."
-                        " If you believe this was sent in error, please modmail /r/BotDefense."
-                    )
-        # looks like a removal
-        elif re.search("^/?u/[\w-]+ has been removed as a moderator from /?(r|u|user)/[\w-]+$", str(message.subject)):
-            message.mark_read()
-            load_subreddits(force=True)
-            if sub not in SUBREDDIT_LIST:
-                logging.info("removed as moderator from /r/" + sub)
-        # some other type of subreddit message
-        else:
-            message.mark_read()
+        except Exception as e:
+            logging.error("exception checking mail: {}".format(e))
 
 
 def join_subreddit(subreddit):
