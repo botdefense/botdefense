@@ -26,14 +26,16 @@ FREQUENCY = {
     "sync_friends": 300,
 }
 LAST = {}
-BAN_TEMPLATE = ("Bots are not welcome on /r/{}.\n\n"
-                "[I am a bot, and this action was performed automatically]"
-                "(/r/BotDefense/about/sticky). "
-                "If you wish to dispute whether this account is a bot, please "
-                "[contact the moderators of /r/BotDefense]"
-                "(https://www.reddit.com/message/compose?"
-                "to=/r/BotDefense&subject=Ban%20dispute%20for%20/u/{}%20on%20/r/{}).")
-
+BAN_MESSAGE = ("Bots are not welcome on /r/{}.\n\n"
+               "[I am a bot, and this action was performed automatically]"
+               "(/r/BotDefense/about/sticky). "
+               "If you wish to dispute whether this account is a bot, please "
+               "[contact the moderators of /r/BotDefense]"
+               "(https://www.reddit.com/message/compose?"
+               "to=/r/BotDefense&subject=Ban%20dispute%20for%20/u/{}%20on%20/r/{}).")
+PERMISSIONS_MESSAGE = ("Thank you for adding BotDefense!\n\n"
+                       "This bot works best with `access` and `posts` permissions (current permissions: {}). "
+                       "For more information, [please read this guide](/r/BotDefense/about/sticky).")
 
 # setup
 logging.basicConfig(
@@ -309,7 +311,7 @@ def ban(author, sub, link, mute):
         date = str(datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d"))
         try:
             r.subreddit(sub).banned.add(
-                author, ban_message=BAN_TEMPLATE.format(sub, author, sub),
+                author, ban_message=BAN_MESSAGE.format(sub, author, sub),
                 note="/u/{} banned by /u/BotDefense at {} for {}".format(author, date, link))
             logging.info("banned /u/{} in /r/{}".format(author, sub))
             if mute:
@@ -457,6 +459,13 @@ def check_mail():
                 if result:
                     message.mark_read()
                     logging.info("joined /r/{}".format(sub))
+                    permissions = message.subreddit.moderator("BotDefense")[0].mod_permissions
+                    if not "all" in permissions:
+                        if not "access" in permissions or not "posts" in permissions:
+                            if not permissions:
+                                permissions = ["*no permissions*"]
+                            logging.warning("incorrect permissions ({}) on /r/{}".format(", ".join(permissions), sub))
+                            message.reply(PERMISSIONS_MESSAGE.format(", ".join(permissions)))
                 else:
                     message.mark_read()
                     if reason == "error":
