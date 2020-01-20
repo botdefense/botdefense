@@ -306,7 +306,7 @@ def ban(author, sub, link, mute):
             logging.info("/u/{} already banned in /r/{}".format(author, sub))
             already_banned = True
     except Exception as e:
-        logging.error("error banning /u/{} in /r/{}: {}".format(author, sub, e))
+        logging.error("error checking ban status for /u/{} in /r/{}: {}".format(author, sub, e))
     if not already_banned:
         date = str(datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d"))
         try:
@@ -318,7 +318,7 @@ def ban(author, sub, link, mute):
                 logging.info("muting /u/{} in /r/{}".format(author, sub))
                 r.subreddit(sub).muted.add(author)
         except Exception as e:
-            logging.error("error banning /u/{}: {}".format(author, e))
+            logging.error("error banning /u/{} in /r/{}: {}".format(author, sub, e))
 
 
 def unban(account):
