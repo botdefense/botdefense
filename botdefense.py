@@ -513,14 +513,24 @@ def sync_friends():
 
     logging.info("syncing friends")
     try:
+        friends = []
+        recent = {}
         for log in r.subreddit("BotDefense").mod.log(action="editflair", limit=100):
             # only log ids can be persistently cached, not submission ids
             if str(log.id) in LOG_IDS:
                 continue
+            # cache friends and recent submissions
+            if not friends:
+                friends = r.user.friends()
+                if not friends:
+                    raise ValueError("empty friends list")
+                for submission in r.subreddit("BotDefense").new(limit=100):
+                    recent[str(submission)] = submission
             try:
                 if log.target_author == "BotDefense" and log.target_fullname.startswith("t3_"):
-                    submission = r.submission(id=log.target_fullname[3:])
-                    sync_submission(submission)
+                    entry = log.target_fullname[3:]
+                    if sync_submission(recent.get(entry, r.submission(id=entry)), friends):
+                        friends = r.user.friends()
                 # we only cache log identifiers after processing successfully
                 LOG_IDS.append(str(log.id))
             except Exception as e:
@@ -533,23 +543,23 @@ def sync_friends():
         LOG_IDS = LOG_IDS[100:]
 
 
-def sync_submission(submission):
+def sync_submission(submission, friends):
     account = None
     if submission.url:
         m = re.search("/(?:u|user)/([\w-]+)", submission.url)
         if m:
             account = str(m.group(1))
     if account and submission.link_flair_text != "pending":
-        is_friended = is_friend(account)
-        if is_friended is None:
-            logging.info("skipping " + account)
-        elif is_friended is False and submission.link_flair_text == "banned":
+        if submission.link_flair_text == "banned" and account not in friends:
             logging.info("adding friend " + account)
             r.redditor(account).friend()
-        elif is_friended and submission.link_flair_text != "banned":
+            return True
+        elif submission.link_flair_text != "banned" and account in friends:
             logging.info("removing friend " + account)
             r.redditor(account).unfriend()
             unban(account)
+            return True
+    return False
 
 
 def run():
