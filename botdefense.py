@@ -536,7 +536,7 @@ def sync_friends():
                 # we only cache log identifiers after processing successfully
                 LOG_IDS.append(str(log.id))
             except Exception as e:
-                logging.info("exception processing log {}: ".format(log.id, e))
+                logging.info("exception processing log {}: {}".format(log.id, e))
     except Exception as e:
         logging.info("exception syncing friends: {}".format(e))
 
@@ -578,6 +578,7 @@ def run():
 
 
 if __name__ == "__main__":
+    logging.info("starting")
     while True:
         try:
             run()
