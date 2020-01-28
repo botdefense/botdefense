@@ -200,10 +200,12 @@ def check_queue():
         return
 
     logging.info("checking queue")
-    friends = r.user.friends()
+    friends = []
     for submission in r.subreddit("mod").mod.modqueue(limit=100, only="submissions"):
         if str(submission.id) in QUEUE_IDS:
             continue
+        if not friends:
+            friends = r.user.friends()
         if submission.author in friends:
             link = "https://www.reddit.com/comments/" + str(submission.id)
             logging.info("queue hit for /u/{} in /r/{} at {}".format(submission.author, submission.subreddit, link))
