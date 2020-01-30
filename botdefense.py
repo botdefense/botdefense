@@ -241,7 +241,7 @@ def consider_action(post, link):
 
     is_proof_flaired = False
     try:
-        if str(post.author_flair_css_class).endswith("proof"):
+        if re.search("proof\\b", str(post.author_flair_css_class)):
             is_proof_flaired = True
             logging.info("/u/{} is whitelisted via flair class in /r/{}".format(author, sub))
     except Exception as e:
