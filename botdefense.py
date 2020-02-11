@@ -23,6 +23,7 @@ FREQUENCY = {
     "check_queue": 60,
     "check_mail": 120,
     "check_contributions": 60,
+    "check_unbans": 15,
     "sync_friends": 300,
 }
 LAST = {}
@@ -36,6 +37,7 @@ BAN_MESSAGE = ("Bots are not welcome on /r/{}.\n\n"
 PERMISSIONS_MESSAGE = ("Thank you for adding BotDefense!\n\n"
                        "This bot works best with `access` and `posts` permissions (current permissions: {}). "
                        "For more information, [please read this guide](/r/BotDefense/about/sticky).")
+UNBAN_STATE = {}
 
 # setup
 logging.basicConfig(
@@ -323,24 +325,20 @@ def ban(author, sub, link, mute):
             logging.error("error banning /u/{} in /r/{}: {}".format(author, sub, e))
 
 
-def unban(account):
-    for subreddit in SUBREDDIT_LIST:
-        try:
-            for ban in r.subreddit(subreddit).banned(account):
-                try:
-                    if ban.note and re.search("BotDefense", ban.note):
-                        logging.info("unbanning /u/{} on /r/{} ({})".format(account, subreddit, ban.note))
-                        r.subreddit(subreddit).banned.remove(account)
-                    else:
-                        note = ban.note
-                        if not note:
-                            note = "[empty]"
-                        logging.debug("not unbanning /u/{} on /r/{} ({})".format(account, subreddit, note))
-                except Exception as e:
-                    logging.error("exception unbanning /u/{} on /r/{}".format(account, subreddit))
-        except:
-            # we could check permissions, but this seems sufficient
-            logging.warning("unable to check ban for /u/{} on /r/{}".format(account, subreddit))
+def unban(account, subreddit):
+    try:
+        for ban in r.subreddit(subreddit).banned(account):
+            try:
+                if ban.note and re.search("BotDefense", ban.note):
+                    logging.info("unbanning /u/{} on /r/{} ({})".format(account, subreddit, ban.note))
+                    r.subreddit(subreddit).banned.remove(account)
+                else:
+                    logging.debug("not unbanning /u/{} on /r/{} ({})".format(account, subreddit, ban.note or "[empty]"))
+            except Exception as e:
+                logging.error("exception unbanning /u/{} on /r/{}".format(account, subreddit))
+    except:
+        # we could check permissions, but this seems sufficient
+        logging.warning("unable to check ban for /u/{} on /r/{}".format(account, subreddit))
 
 
 def check_contributions():
@@ -540,6 +538,15 @@ def sync_friends():
     except Exception as e:
         logging.info("exception syncing friends: {}".format(e))
 
+    # check for pending unbans
+    try:
+        if not UNBAN_STATE:
+            for flair in r.subreddit("BotDefense").flair():
+                if flair.get("user") and "unban" in flair.get("flair_css_class"):
+                    UNBAN_STATE[str(flair.get("user"))] = list(SUBREDDIT_LIST)
+    except Exception as e:
+        logging.error("exception checking for pending unbans: {}".format(e))
+
     # trim cache
     if len(LOG_IDS) > 200:
         LOG_IDS = LOG_IDS[100:]
@@ -559,9 +566,30 @@ def sync_submission(submission, friends):
         elif submission.link_flair_text != "banned" and account in friends:
             logging.info("removing friend " + account)
             r.redditor(account).unfriend()
-            unban(account)
+            r.subreddit("BotDefense").flair.set(account, css_class = "unban")
             return True
     return False
+
+
+def check_unbans():
+    if not ready("check_unbans"):
+        return
+
+    logging.info("checking unbans")
+    if not UNBAN_STATE:
+        return
+    try:
+        pause = time.time() + 10
+        account = next(iter(UNBAN_STATE))
+        logging.info("processing unban for /u/{} ({} subreddits remaining)".format(account, len(UNBAN_STATE[account])))
+        while UNBAN_STATE[account] and time.time() < pause:
+            unban(account, UNBAN_STATE[account].pop(0))
+        if not UNBAN_STATE[account]:
+            logging.info("finished unban for /u/{}".format(account))
+            r.subreddit("BotDefense").flair.delete(account)
+            del UNBAN_STATE[account]
+    except Exception as e:
+        logging.info("exception checking unbans: {}".format(e))
 
 
 def run():
@@ -573,6 +601,7 @@ def run():
     check_queue()
     check_mail()
     check_contributions()
+    check_unbans()
     sync_friends()
     time.sleep(1)
 
