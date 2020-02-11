@@ -384,21 +384,28 @@ def check_contributions():
 
         title = "overview for " + name
         url = "https://www.reddit.com/user/" + name
-        try:
-            for query in "url:\"{}\"".format(url), "title:\"{}\"".format(name):
+
+        for query in "url:\"{}\"".format(url), "title:\"{}\"".format(name):
+            try:
                 for similar in r.subreddit("BotDefense").search(query):
                     if similar.title == title and similar.author == "BotDefense":
                         canonical = similar
                         break
                 if canonical:
                     break
+            except Exception as e:
+                logging.error("exception searching {} for canonical post: {}".format(query, e))
+
+        try:
             if not canonical:
                 for recent in r.subreddit("BotDefense").new(limit=1000):
                     if recent.title == title and recent.author == "BotDefense":
                         canonical = recent
                         break
-                    if recent.created_utc < time.time() - 604800:
-                        break
+        except Exception as e:
+            logging.error("exception checking recent posts for canonical post: {}".format(e))
+
+        try:
             if not canonical:
                 post = r.subreddit("BotDefense").submit(title, url=url)
                 post.report("Reviewable submission from /u/{}: please approve and update flair".format(submission.author))
