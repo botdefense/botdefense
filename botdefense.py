@@ -1,6 +1,7 @@
 #!/usr/bin/python
 
 import praw
+import prawcore.exceptions
 import time
 from datetime import datetime
 import re
@@ -567,13 +568,19 @@ def sync_submission(submission, friends):
             account = str(m.group(1))
     if account and submission.link_flair_text != "pending":
         if submission.link_flair_text == "banned" and account not in friends:
-            logging.info("adding friend " + account)
-            r.redditor(account).friend()
+            logging.info("adding friend /u/{}".format(account))
+            try:
+                r.redditor(account).friend()
+            except prawcore.exceptions.BadRequest as e:
+                logging.warning("error adding friend /u/{}: {}".format(account, e))
             return True
         elif submission.link_flair_text != "banned" and account in friends:
-            logging.info("removing friend " + account)
-            r.redditor(account).unfriend()
-            r.subreddit("BotDefense").flair.set(account, css_class = "unban")
+            logging.info("removing friend /u/{}".format(account))
+            try:
+                r.redditor(account).unfriend()
+                r.subreddit("BotDefense").flair.set(account, css_class = "unban")
+            except prawcore.exceptions.BadRequest as e:
+                logging.warning("error removing friend /u/{}: {}".format(account, e))
             return True
     return False
 
