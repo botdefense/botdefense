@@ -542,9 +542,9 @@ def sync_friends():
                 # we only cache log identifiers after processing successfully
                 LOG_IDS.append(str(log.id))
             except Exception as e:
-                logging.info("exception processing log {}: {}".format(log.id, e))
+                logging.error("exception processing log {}: {}".format(log.id, e))
     except Exception as e:
-        logging.info("exception syncing friends: {}".format(e))
+        logging.error("exception syncing friends: {}".format(e))
 
     # check for pending unbans
     try:
@@ -603,7 +603,7 @@ def check_unbans():
             r.subreddit("BotDefense").flair.delete(account)
             del UNBAN_STATE[account]
     except Exception as e:
-        logging.info("exception checking unbans: {}".format(e))
+        logging.error("exception checking unbans: {}".format(e))
 
 
 def run():
