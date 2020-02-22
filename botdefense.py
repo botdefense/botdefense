@@ -572,6 +572,8 @@ def sync_submission(submission, friends):
             try:
                 r.redditor(account).friend()
             except prawcore.exceptions.BadRequest as e:
+                logging.info("bad request adding friend /u/{}: {}".format(account, e))
+            except Exception as e:
                 logging.warning("error adding friend /u/{}: {}".format(account, e))
             return True
         elif submission.link_flair_text != "banned" and account in friends:
@@ -580,6 +582,8 @@ def sync_submission(submission, friends):
                 r.redditor(account).unfriend()
                 r.subreddit("BotDefense").flair.set(account, css_class = "unban")
             except prawcore.exceptions.BadRequest as e:
+                logging.info("bad request removing friend /u/{}: {}".format(account, e))
+            except Exception as e:
                 logging.warning("error removing friend /u/{}: {}".format(account, e))
             return True
     return False
