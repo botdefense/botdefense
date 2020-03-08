@@ -337,9 +337,10 @@ def unban(account, subreddit):
                     logging.debug("not unbanning /u/{} on /r/{} ({})".format(account, subreddit, ban.note or "[empty]"))
             except Exception as e:
                 logging.error("exception unbanning /u/{} on /r/{}".format(account, subreddit))
-    except:
-        # we could check permissions, but this seems sufficient
-        logging.warning("unable to check ban for /u/{} on /r/{}".format(account, subreddit))
+    except prawcore.exceptions.Forbidden as e:
+        logging.info("unable to check ban for /u/{} in /r/{}: {}".format(account, subreddit, e))
+    except Exception as e:
+        logging.warning("error checking ban for /u/{} in /r/{}: {}".format(account, subreddit, e))
 
 
 def check_contributions():
