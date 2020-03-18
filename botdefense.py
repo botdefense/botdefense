@@ -282,6 +282,11 @@ def consider_action(post, link):
                     post.mod.remove(spam=True)
             except Exception as e:
                 logging.error("error removing {}: {}".format(link, e))
+        elif permissions:
+            try:
+                post.report("bot (moderator permissions limited to reporting)")
+            except Exception as e:
+                logging.error("error reporting {}: {}".format(link, e))
 
 
 def is_friend(user):
