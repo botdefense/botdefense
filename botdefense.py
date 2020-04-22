@@ -173,7 +173,7 @@ def check_comments():
 
     # trim cache
     if len(COMMENT_IDS) > 200:
-        COMMENT_IDS = COMMENT_IDS[100:]
+        COMMENT_IDS = COMMENT_IDS[-200:]
 
 
 def check_submissions():
@@ -193,7 +193,7 @@ def check_submissions():
 
     # trim cache
     if len(SUBMISSION_IDS) > 200:
-        SUBMISSION_IDS = SUBMISSION_IDS[100:]
+        SUBMISSION_IDS = SUBMISSION_IDS[-200:]
 
 
 def check_queue():
@@ -218,7 +218,7 @@ def check_queue():
 
     # trim cache
     if len(QUEUE_IDS) > 200:
-        QUEUE_IDS = QUEUE_IDS[100:]
+        QUEUE_IDS = QUEUE_IDS[-200:]
 
 
 def consider_action(post, link):
@@ -277,7 +277,7 @@ def consider_action(post, link):
             ban(author, sub, link, ("mail" in permissions))
         if "posts" in permissions or "all" in permissions:
             try:
-                if not (post.removed or post.spam):
+                if not post.banned_by:
                     logging.info("removing " + link)
                     post.mod.remove(spam=True)
             except Exception as e:
@@ -386,7 +386,7 @@ def check_contributions():
                                        " exist (perhaps it has already been suspended, banned, or deleted),"
                                        " but please send modmail if you believe this was an error.")
             comment.mod.distinguish()
-            logging.info("contribution {} rejected".format(submission.permalink))
+            logging.info("contribution {} from /u/{} rejected".format(submission.permalink, submission.author))
             continue
 
         title = "overview for " + name
@@ -425,16 +425,16 @@ def check_contributions():
             comment = submission.reply("Thank you for your submission! We have created a new"
                                        " [entry for this account]({}).".format(post.permalink))
             comment.mod.distinguish()
-            logging.info("contribution {} accepted for {}".format(submission.permalink, name))
+            logging.info("contribution {} from /u/{} accepted for {}".format(submission.permalink, submission.author, name))
         elif canonical:
             comment = submission.reply("Thank you for your submission! It looks like we already have"
                                        " an [entry for this account]({}).".format(canonical.permalink))
             comment.mod.distinguish()
-            logging.info("contribution {} duplicate for {}".format(submission.permalink, name))
+            logging.info("contribution {} from /u/{} duplicate for {}".format(submission.permalink, submission.author, name))
         else:
             comment = submission.reply("Thank you for your submission!")
             comment.mod.distinguish()
-            logging.error("contribution {} error".format(submission.permalink))
+            logging.error("contribution {} from /u/{} error".format(submission.permalink, submission.author))
             r.subreddit("BotDefense").message("Error processing contribution",
                                               "{}".format(submission.permalink))
 
@@ -504,6 +504,8 @@ def check_mail():
 
 
 def join_subreddit(subreddit):
+    global SUBREDDIT_LIST
+
     if subreddit.quarantine:
         return False, "quarantined"
     elif subreddit.subreddit_type not in ["public", "restricted", "gold_only", "user"]:
@@ -563,7 +565,7 @@ def sync_friends():
 
     # trim cache
     if len(LOG_IDS) > 200:
-        LOG_IDS = LOG_IDS[100:]
+        LOG_IDS = LOG_IDS[-200:]
 
 
 def sync_submission(submission, friends):
