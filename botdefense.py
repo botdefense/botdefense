@@ -1,15 +1,42 @@
-#!/usr/bin/python
+#!/usr/bin/env python3.7
 
-import praw
-import prawcore.exceptions
+import os
+import sys
+import logging
+import re
 import time
 from datetime import datetime
-import re
-import logging
+import praw
+import prawcore.exceptions
+
+
+# setup
+os.environ['TZ'] = 'UTC'
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(funcName)s | %(message)s',
+    datefmt='%Y-%m-%dT%H:%M:%S',
+)
+try:
+    assert praw.__version__.startswith('7.0.')
+    configuration = sys.argv[1]
+    r = praw.Reddit(configuration)
+    r.validate_on_submit = True
+    ME = str(r.user.me())
+    HOME = r.subreddit(ME)
+    SCAN = r.subreddit(r.config.custom.get("scan", "all"))
+except IndexError:
+    logging.error("usage: {} <praw.ini section>".format(sys.argv[0]))
+    sys.exit(1)
+except Exception as e:
+    logging.error("failed to obtain PRAW instance: {}".format(e))
+    time.sleep(60)
+    sys.exit(1)
 
 
 # global data
 STATUS_POST = None
+FRIEND_LIST = []
 SUBREDDIT_LIST = []
 COMMENT_IDS = []
 SUBMISSION_IDS = []
@@ -18,6 +45,7 @@ LOG_IDS = []
 FREQUENCY = {
     "kill_switch": 60,
     "update_status": 300,
+    "friend_list": 600,
     "load_subreddits": 3600,
     "check_comments": 5,
     "check_submissions": 30,
@@ -25,29 +53,22 @@ FREQUENCY = {
     "check_mail": 120,
     "check_contributions": 60,
     "check_unbans": 15,
-    "sync_friends": 300,
+    "check_state": 300,
 }
 LAST = {}
-BAN_MESSAGE = ("Bots are not welcome on /r/{}.\n\n"
+BAN_MESSAGE = ("Bots are not welcome on /r/{1}.\n\n"
                "[I am a bot, and this action was performed automatically]"
-               "(/r/BotDefense/about/sticky). "
+               "(/r/{0}/about/sticky). "
                "If you wish to dispute whether this account is a bot, please "
-               "[contact the moderators of /r/BotDefense]"
+               "[contact the moderators of /r/{0}]"
                "(https://www.reddit.com/message/compose?"
-               "to=/r/BotDefense&subject=Ban%20dispute%20for%20/u/{}%20on%20/r/{}).")
-PERMISSIONS_MESSAGE = ("Thank you for adding BotDefense!\n\n"
-                       "This bot works best with `access` and `posts` permissions (current permissions: {}). "
-                       "For more information, [please read this guide](/r/BotDefense/about/sticky).")
+               "to=/r/{0}&subject=Ban%20dispute%20for%20/u/{2}%20on%20/r/{1}) "
+               "rather than replying to this message.")
+PERMISSIONS_MESSAGE = ("Thank you for adding {}!\n\n"
+                       "This bot works best with `access` and `posts` permissions "
+                       "(current permissions: {}). "
+                       "For more information, [please read this guide](/r/{}/about/sticky).")
 UNBAN_STATE = {}
-
-# setup
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | %(funcName)s | %(message)s',
-    datefmt='%Y-%m-%dT%H:%M:%S',
-)
-praw_config = {"user_agent": "linux:botdefense:v1.0 (by /u/BotDefense)"}
-r = praw.Reddit("botdefense", **praw_config)
 
 
 def ready(key, force=False):
@@ -55,26 +76,39 @@ def ready(key, force=False):
 
     if force or LAST.get(key, 0) < time.time() - FREQUENCY.get(key, 60):
         LAST[key] = time.time()
-        return 1
-    return 0
+        return True
+    return False
 
 
-def kill_switch():
-    if not ready("kill_switch"):
+def kill_switch(force=False):
+    if not ready("kill_switch", force=force):
         return
 
     logging.info("checking kill switch")
     active = False
+    counter = 0
+    sleep = 60
+    retries = 60
     while not active:
         try:
-            if r.subreddit("BotDefense").moderator("BotDefense")[0].mod_permissions:
+            permissions = HOME.moderator(ME)[0].mod_permissions
+            if r.config.custom.get("node") == "primary" and "chat_operator" in permissions:
+                active = False
+            elif r.config.custom.get("node") == "secondary" and "chat_operator" not in permissions:
+                active = False
+                sleep = 600
+                retries = 144
+            elif permissions:
                 active = True
         except Exception as e:
             logging.error("exception checking permissions: {}".format(e))
         if not active:
             logging.info("kill switch activated, sleeping")
-            # sleep needs to be before any other actions to reduce the odds of spinning
-            time.sleep(60)
+            time.sleep(sleep)
+            counter += 1
+            if counter >= retries:
+                logging.error("persistent kill switch, stopping")
+                sys.exit(1)
 
 
 def absolute_time(when):
@@ -103,8 +137,8 @@ def update_status():
 
     logging.info("updating status")
     if not STATUS_POST:
-        for result in r.subreddit("BotDefense").search('title:"BotDefense status"', sort='new'):
-            if result.author == "BotDefense" and result.is_self:
+        for result in HOME.search('title:"{} status"'.format(ME), sort='new'):
+            if result.author == ME and result.is_self:
                 STATUS_POST = result
                 break
         if not STATUS_POST:
@@ -116,14 +150,15 @@ def update_status():
     recent_logs = ""
     try:
         current_time = absolute_time(time.time())
-        for log in r.subreddit("mod").mod.log(mod="BotDefense", limit=500):
+        for log in r.subreddit("mod").mod.log(mod=ME, limit=500):
             if not last_time:
                 last_time = absolute_time(log.created_utc)
                 last_type = log.action
             if log.created_utc < time.time() - 86400:
                 break
             if log.action in ["banuser", "spamcomment"]:
-                recent_logs += "|{}|{}|/u/{}|\n".format(relative_time(log.created_utc), log.action, log.target_author)
+                recent_logs += "|{}|{}|/u/{}|\n".format(relative_time(log.created_utc),
+                                                        log.action, log.target_author)
 
         if recent_logs:
             recent_logs = "|Time|Action|Account|\n|-|-|-|\n" + recent_logs
@@ -141,6 +176,19 @@ def update_status():
         logging.error("unable to update status: {}".format(e))
 
 
+def friend_list(force=False):
+    global FRIEND_LIST
+
+    if not ready("friend_list", force=force):
+        return FRIEND_LIST
+
+    logging.info("loading friends")
+    FRIEND_LIST = r.user.friends()
+    if not FRIEND_LIST:
+        raise RuntimeError("empty friends list")
+    return FRIEND_LIST
+
+
 def load_subreddits(force=False):
     global SUBREDDIT_LIST
 
@@ -148,12 +196,9 @@ def load_subreddits(force=False):
         return
 
     logging.info("loading subreddits")
-    SUBREDDIT_LIST = []
-    # use this method to avoid 100 subreddit limit for now
-    mod_target = "/user/" + str(r.user.me()) + "/moderated_subreddits"
-    for subreddit in r.get(mod_target)['data']:
-        name = subreddit['sr']
-        SUBREDDIT_LIST.append(r.subreddit(name).display_name)
+    SUBREDDIT_LIST = r.user.me().moderated()
+    if not SUBREDDIT_LIST:
+        raise RuntimeError("empty subreddit list")
 
 
 def check_comments():
@@ -163,7 +208,7 @@ def check_comments():
         return
 
     logging.info("checking comments")
-    for comment in r.subreddit("friends").comments(limit=100):
+    for comment in SCAN.comments(limit=100):
         if str(comment.id) in COMMENT_IDS:
             continue
         link = "https://www.reddit.com/comments/{}/_/{}".format(comment.submission.id, comment.id)
@@ -183,7 +228,7 @@ def check_submissions():
         return
 
     logging.info("checking submissions")
-    for submission in r.subreddit("friends").new(limit=100):
+    for submission in SCAN.new(limit=100):
         if str(submission.id) in SUBMISSION_IDS:
             continue
         link = "https://www.reddit.com/comments/" + str(submission.id)
@@ -203,15 +248,13 @@ def check_queue():
         return
 
     logging.info("checking queue")
-    friends = []
     for submission in r.subreddit("mod").mod.modqueue(limit=100, only="submissions"):
         if str(submission.id) in QUEUE_IDS:
             continue
-        if not friends:
-            friends = r.user.friends()
-        if submission.author in friends:
+        if submission.author in friend_list():
             link = "https://www.reddit.com/comments/" + str(submission.id)
-            logging.info("queue hit for /u/{} in /r/{} at {}".format(submission.author, submission.subreddit, link))
+            logging.info("queue hit for /u/{} in /r/{} at {}".format(submission.author,
+                                                                     submission.subreddit, link))
             consider_action(submission, link)
         # we only cache identifiers after processing successfully
         QUEUE_IDS.append(str(submission.id))
@@ -222,59 +265,60 @@ def check_queue():
 
 
 def consider_action(post, link):
-    sub = str(post.subreddit)
-    author = str(post.author)
+    account = post.author
+    sub = post.subreddit
 
     if sub not in SUBREDDIT_LIST:
-        return
+        return False
 
-    logging.info("subreddit hit /u/{} in /r/{}".format(author, sub))
+    logging.info("subreddit hit /u/{} in /r/{}".format(account, sub))
     permissions = []
     try:
-        permissions = post.subreddit.moderator("BotDefense")[0].mod_permissions
+        permissions = sub.moderator(ME)[0].mod_permissions
     except Exception as e:
         logging.error("error checking moderator permissions in /r/{}: {}".format(sub, e))
 
     is_friended = False
-    if is_friend(author):
+    if is_friend(account):
         is_friended = True
-        logging.info("/u/{} confirmed to be on friends list".format(author))
+        logging.info("/u/{} confirmed to be on friends list".format(account))
     else:
-        logging.error("/u/{} is not on friends list".format(author))
+        logging.error("/u/{} is not on friends list".format(account))
 
     is_proof_flaired = False
     try:
         if re.search("proof\\b", str(post.author_flair_css_class)):
             is_proof_flaired = True
-            logging.info("/u/{} is whitelisted via flair class in /r/{}".format(author, sub))
+            logging.info("/u/{} is whitelisted via flair class in /r/{}".format(account, sub))
     except Exception as e:
-        logging.error("error checking flair class for /u/{} in /r/{}: {}".format(author, sub, e))
+        logging.error("error checking flair class for /u/{} in /r/{}: {}".format(account, sub, e))
 
     is_contributor = False
     try:
-        for contributor in post.subreddit.contributor(author):
+        for contributor in sub.contributor(account):
             is_contributor = True
-            logging.info("/u/{} is whitelisted via approved users in /r/{}".format(author, sub))
+            logging.info("/u/{} is whitelisted via approved users in /r/{}".format(account, sub))
     except Exception as e:
-        logging.info("unable to check approved users for /u/{} in /r/{}: {}".format(author, sub, e))
+        logging.info("unable to check approved users for /u/{} in /r/{}: {}".format(account, sub, e))
         # fail safe
         if not permissions or "access" in permissions or "all" in permissions:
             is_contributor = True
-            logging.error("failing safe for /u/{} in /r/{}".format(author, sub))
+            logging.error("failing safe for /u/{} in /r/{}".format(account, sub))
 
     is_moderator = False
     try:
-        if post.subreddit.moderator(author):
+        if sub.moderator(account):
             is_moderator = True
-            logging.info("/u/{} is whitelisted via moderator list in /r/{}".format(author, sub))
+            logging.info("/u/{} is whitelisted via moderator list in /r/{}".format(account, sub))
     except Exception as e:
         # fail safe
         is_moderator = True
-        logging.error("error checking moderator list, failing safe for /u/{} in /r/{}: {}".format(author, sub, e))
+        logging.error("error checking moderator list, failing safe for /u/{} in /r/{}: {}".format(account, sub, e))
 
     if is_friended and not is_proof_flaired and not is_contributor and not is_moderator:
+        kill_switch()
         if "access" in permissions or "all" in permissions:
-            ban(author, sub, link, ("mail" in permissions))
+            ban(account, sub, link, ("mail" in permissions))
         if "posts" in permissions or "all" in permissions:
             try:
                 if not post.banned_by:
@@ -287,6 +331,9 @@ def consider_action(post, link):
                 post.report("bot (moderator permissions limited to reporting)")
             except Exception as e:
                 logging.error("error reporting {}: {}".format(link, e))
+        return True
+
+    return False
 
 
 def is_friend(user):
@@ -308,44 +355,44 @@ def is_friend(user):
     return None
 
 
-def ban(author, sub, link, mute):
+def ban(account, sub, link, mute):
     already_banned = False
-    logging.info("banning /u/{} in /r/{}".format(author, sub))
+    logging.info("banning /u/{} in /r/{}".format(account, sub))
     try:
-        for ban in r.subreddit(sub).banned(author):
-            logging.info("/u/{} already banned in /r/{}".format(author, sub))
+        for ban in sub.banned(account):
+            logging.info("/u/{} already banned in /r/{}".format(account, sub))
             already_banned = True
     except Exception as e:
-        logging.error("error checking ban status for /u/{} in /r/{}: {}".format(author, sub, e))
+        logging.error("error checking ban status for /u/{} in /r/{}: {}".format(account, sub, e))
     if not already_banned:
         date = str(datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d"))
         try:
-            r.subreddit(sub).banned.add(
-                author, ban_message=BAN_MESSAGE.format(sub, author, sub),
-                note="/u/{} banned by /u/BotDefense at {} for {}".format(author, date, link))
-            logging.info("banned /u/{} in /r/{}".format(author, sub))
+            sub.banned.add(
+                account, ban_message=BAN_MESSAGE.format(HOME, sub, account),
+                note="/u/{} banned by /u/{} at {} for {}".format(account, ME, date, link))
+            logging.info("banned /u/{} in /r/{}".format(account, sub))
             if mute:
-                logging.info("muting /u/{} in /r/{}".format(author, sub))
-                r.subreddit(sub).muted.add(author)
+                logging.info("muting /u/{} in /r/{}".format(account, sub))
+                sub.muted.add(account)
         except Exception as e:
-            logging.error("error banning /u/{} in /r/{}: {}".format(author, sub, e))
+            logging.error("error banning /u/{} in /r/{}: {}".format(account, sub, e))
 
 
-def unban(account, subreddit):
+def unban(account, sub):
     try:
-        for ban in r.subreddit(subreddit).banned(account):
+        for ban in sub.banned(account):
             try:
-                if ban.note and re.search("BotDefense", ban.note):
-                    logging.info("unbanning /u/{} on /r/{} ({})".format(account, subreddit, ban.note))
-                    r.subreddit(subreddit).banned.remove(account)
+                if ban.note and re.search(ME, ban.note):
+                    logging.info("unbanning /u/{} on /r/{} ({})".format(account, sub, ban.note))
+                    sub.banned.remove(account)
                 else:
-                    logging.debug("not unbanning /u/{} on /r/{} ({})".format(account, subreddit, ban.note or "[empty]"))
+                    logging.debug("not unbanning /u/{} on /r/{} ({})".format(account, sub, ban.note or "[empty]"))
             except Exception as e:
-                logging.error("exception unbanning /u/{} on /r/{}".format(account, subreddit))
+                logging.error("exception unbanning /u/{} on /r/{}".format(account, sub))
     except prawcore.exceptions.Forbidden as e:
-        logging.info("unable to check ban for /u/{} in /r/{}: {}".format(account, subreddit, e))
+        logging.info("unable to check ban for /u/{} in /r/{}: {}".format(account, sub, e))
     except Exception as e:
-        logging.warning("error checking ban for /u/{} in /r/{}: {}".format(account, subreddit, e))
+        logging.warning("error checking ban for /u/{} in /r/{}: {}".format(account, sub, e))
 
 
 def check_contributions():
@@ -353,9 +400,15 @@ def check_contributions():
         return
 
     logging.info("checking for contributions")
-    for submission in r.subreddit("BotDefense").new(limit=100):
-        if submission.author == "BotDefense":
+    for submission in HOME.new(limit=100):
+        if submission.author == ME:
             continue
+
+        if is_friend(submission.author):
+            logging.info("contribution from friend /u/{}".format(submission.author))
+            link = "https://www.reddit.com/comments/" + str(submission.id)
+            if consider_action(submission, link):
+                continue
 
         account = None
         name = None
@@ -363,7 +416,7 @@ def check_contributions():
         post = None
 
         if submission.url:
-            m = re.search("^https?://(?:\w+\.)?reddit\.com/(?:u|user)/([\w-]{3,20})", submission.url)
+            m = re.search("^https?://(?:\w+\.)?reddit\.com/u(?:ser)?/([\w-]{3,20})", submission.url)
             if m:
                 account = m.group(1)
 
@@ -394,8 +447,8 @@ def check_contributions():
 
         for query in "url:\"{}\"".format(url), "title:\"{}\"".format(name):
             try:
-                for similar in r.subreddit("BotDefense").search(query):
-                    if similar.title == title and similar.author == "BotDefense":
+                for similar in HOME.search(query):
+                    if similar.title == title and similar.author == ME:
                         canonical = similar
                         break
                 if canonical:
@@ -405,8 +458,8 @@ def check_contributions():
 
         try:
             if not canonical:
-                for recent in r.subreddit("BotDefense").new(limit=1000):
-                    if recent.title == title and recent.author == "BotDefense":
+                for recent in HOME.new(limit=1000):
+                    if recent.title == title and recent.author == ME:
                         canonical = recent
                         break
         except Exception as e:
@@ -414,7 +467,7 @@ def check_contributions():
 
         try:
             if not canonical:
-                post = r.subreddit("BotDefense").submit(title, url=url)
+                post = HOME.submit(title, url=url)
                 post.report("Reviewable submission from /u/{}: please approve and update flair".format(submission.author))
                 post.disable_inbox_replies()
         except Exception as e:
@@ -435,8 +488,7 @@ def check_contributions():
             comment = submission.reply("Thank you for your submission!")
             comment.mod.distinguish()
             logging.error("contribution {} from /u/{} error".format(submission.permalink, submission.author))
-            r.subreddit("BotDefense").message("Error processing contribution",
-                                              "{}".format(submission.permalink))
+            HOME.message("Error processing contribution", "{}".format(submission.permalink))
 
 
 def check_mail():
@@ -454,7 +506,7 @@ def check_mail():
             if not message.subreddit:
                 message.mark_read()
                 if message.distinguished != "admin":
-                    message.reply("Please modmail /r/BotDefense if you would like to get in touch.")
+                    message.reply("Please modmail /r/{} if you would like to get in touch.".format(HOME))
                 continue
 
             sub = message.subreddit.display_name
@@ -473,13 +525,13 @@ def check_mail():
                 if result:
                     message.mark_read()
                     logging.info("joined /r/{}".format(sub))
-                    permissions = message.subreddit.moderator("BotDefense")[0].mod_permissions
+                    permissions = message.subreddit.moderator(ME)[0].mod_permissions
                     if not "all" in permissions:
                         if not "access" in permissions or not "posts" in permissions:
                             if not permissions:
                                 permissions = ["*no permissions*"]
-                            logging.warning("incorrect permissions ({}) on /r/{}".format(", ".join(permissions), sub))
-                            message.reply(PERMISSIONS_MESSAGE.format(", ".join(permissions)))
+                            logging.info("incorrect permissions ({}) on /r/{}".format(", ".join(permissions), sub))
+                            message.reply(PERMISSIONS_MESSAGE.format(ME, ", ".join(permissions), HOME))
                 else:
                     message.mark_read()
                     if reason == "error":
@@ -488,7 +540,7 @@ def check_mail():
                         logging.info("declining invite from {} subreddit /r/{}".format(reason, sub))
                         message.reply(
                             "This bot isn't really needed on non-public subreddits due to very limited bot"
-                            " activity. If you believe this was sent in error, please modmail /r/BotDefense."
+                            " activity. If you believe this was sent in error, please modmail /r/{}.".format(HOME)
                         )
             # looks like a removal
             elif re.search("^/?u/[\w-]+ has been removed as a moderator from /?(r|u|user)/[\w-]+$", str(message.subject)):
@@ -521,34 +573,33 @@ def join_subreddit(subreddit):
         return True, None
 
 
-def sync_friends():
+def check_state():
     global LOG_IDS
 
-    if not ready("sync_friends"):
+    if not ready("check_state"):
         return
 
-    logging.info("syncing friends")
+    logging.info("checking state")
     try:
         friends = []
         recent = {}
-        for log in r.subreddit("BotDefense").mod.log(action="editflair", limit=100):
+        for log in HOME.mod.log(action="editflair", limit=100):
             # only log ids can be persistently cached, not submission ids
             if str(log.id) in LOG_IDS:
                 continue
             # cache friends and recent submissions
             if not friends:
-                friends = r.user.friends()
-                if not friends:
-                    raise ValueError("empty friends list")
-                for submission in r.subreddit("BotDefense").new(limit=100):
+                friends = friend_list(force=True)
+                for submission in HOME.new(limit=100):
                     recent[str(submission)] = submission
             try:
-                if log.target_author == "BotDefense" and log.target_fullname.startswith("t3_"):
+                if log.target_author == ME and log.target_fullname.startswith("t3_"):
                     entry = log.target_fullname[3:]
                     if sync_submission(recent.get(entry, r.submission(id=entry)), friends):
-                        friends = r.user.friends()
-                # we only cache log identifiers after processing successfully
-                LOG_IDS.append(str(log.id))
+                        friends = friend_list(force=True)
+                # we only cache non-recent log identifiers after processing successfully
+                if log.created_utc < time.time() - 600:
+                    LOG_IDS.append(str(log.id))
             except Exception as e:
                 logging.error("exception processing log {}: {}".format(log.id, e))
     except Exception as e:
@@ -557,11 +608,12 @@ def sync_friends():
     # check for pending unbans
     try:
         if not UNBAN_STATE:
-            for flair in r.subreddit("BotDefense").flair():
+            for flair in HOME.flair():
                 if flair.get("user") and "unban" in flair.get("flair_css_class"):
-                    UNBAN_STATE[str(flair.get("user"))] = list(SUBREDDIT_LIST)
+                    UNBAN_STATE[flair.get("user")] = list(SUBREDDIT_LIST)
     except Exception as e:
         logging.error("exception checking for pending unbans: {}".format(e))
+        kill_switch(force=True)
 
     # trim cache
     if len(LOG_IDS) > 200:
@@ -571,28 +623,30 @@ def sync_friends():
 def sync_submission(submission, friends):
     account = None
     if submission.url:
-        m = re.search("/(?:u|user)/([\w-]+)", submission.url)
+        m = re.search("/u(?:ser)?/([\w-]+)", submission.url)
         if m:
-            account = str(m.group(1))
+            account = m.group(1)
     if account and submission.link_flair_text != "pending":
         if submission.link_flair_text == "banned" and account not in friends:
-            logging.info("adding friend /u/{}".format(account))
             try:
                 r.redditor(account).friend()
-            except prawcore.exceptions.BadRequest as e:
-                logging.info("bad request adding friend /u/{}: {}".format(account, e))
+                logging.info("added friend /u/{}".format(account))
+            except praw.exceptions.RedditAPIException as e:
+                if e.items[0].error_type == "USER_DOESNT_EXIST":
+                    logging.debug("unable to add friend /u/{}: {}".format(account, e))
+                    return False
+                else:
+                    logging.error("error adding friend /u/{}: {}".format(account, e))
             except Exception as e:
-                logging.warning("error adding friend /u/{}: {}".format(account, e))
+                logging.error("error adding friend /u/{}: {}".format(account, e))
             return True
         elif submission.link_flair_text != "banned" and account in friends:
-            logging.info("removing friend /u/{}".format(account))
             try:
                 r.redditor(account).unfriend()
-                r.subreddit("BotDefense").flair.set(account, css_class = "unban")
-            except prawcore.exceptions.BadRequest as e:
-                logging.info("bad request removing friend /u/{}: {}".format(account, e))
+                logging.info("removed friend /u/{}".format(account))
+                HOME.flair.set(account, css_class="unban")
             except Exception as e:
-                logging.warning("error removing friend /u/{}: {}".format(account, e))
+                logging.error("error removing friend /u/{}: {}".format(account, e))
             return True
     return False
 
@@ -612,14 +666,13 @@ def check_unbans():
             unban(account, UNBAN_STATE[account].pop(0))
         if not UNBAN_STATE[account]:
             logging.info("finished unban for /u/{}".format(account))
-            r.subreddit("BotDefense").flair.delete(account)
+            HOME.flair.delete(account)
             del UNBAN_STATE[account]
     except Exception as e:
         logging.error("exception checking unbans: {}".format(e))
 
 
 def run():
-    kill_switch()
     update_status()
     load_subreddits()
     check_comments()
@@ -628,19 +681,20 @@ def run():
     check_mail()
     check_contributions()
     check_unbans()
-    sync_friends()
+    check_state()
     time.sleep(1)
 
 
 if __name__ == "__main__":
     logging.info("starting")
+    kill_switch()
     while True:
         try:
             run()
         except KeyboardInterrupt:
             logging.error("received SIGINT from keyboard, stopping")
-            exit(1)
+            sys.exit(1)
         except Exception as e:
             logging.error("site error: {}".format(e))
             time.sleep(60)
-            exit(1)
+            sys.exit(1)
