@@ -390,7 +390,7 @@ def unban(account, sub):
             except Exception as e:
                 logging.error("exception unbanning /u/{} on /r/{}".format(account, sub))
     except prawcore.exceptions.Forbidden as e:
-        logging.info("unable to check ban for /u/{} in /r/{}: {}".format(account, sub, e))
+        logging.debug("unable to check ban for /u/{} in /r/{}: {}".format(account, sub, e))
     except Exception as e:
         logging.warning("error checking ban for /u/{} in /r/{}: {}".format(account, sub, e))
 
@@ -525,7 +525,14 @@ def check_mail():
                 if result:
                     message.mark_read()
                     logging.info("joined /r/{}".format(sub))
-                    permissions = message.subreddit.moderator(ME)[0].mod_permissions
+                    for delay in range(3):
+                        time.sleep(delay)
+                        moderator = message.subreddit.moderator(ME)
+                        if moderator:
+                            break
+                    if not moderator:
+                        raise RuntimeError("not in moderator list")
+                    permissions = moderator[0].mod_permissions
                     if not "all" in permissions:
                         if not "access" in permissions or not "posts" in permissions:
                             if not permissions:
