@@ -514,13 +514,11 @@ def check_mail():
             # looks like an invite
             if re.search("^invitation to moderate /?(r|u|user)/[\w-]+$", str(message.subject)):
                 logging.info("invited to moderate /r/{}".format(sub))
-                result = None
-                reason = None
 
                 try:
                     result, reason = join_subreddit(message.subreddit)
                 except:
-                    reason = "error"
+                    result, reason = False, "error"
 
                 if result:
                     message.mark_read()
@@ -543,7 +541,7 @@ def check_mail():
                     message.mark_read()
                     if reason == "error":
                         logging.info("failure accepting invite {} from /r/{}".format(message.fullname, sub))
-                    elif reason:
+                    elif reason and reason != "banned":
                         logging.info("declining invite from {} subreddit /r/{}".format(reason, sub))
                         message.reply(
                             "This bot isn't really needed on non-public subreddits due to very limited bot"
@@ -565,16 +563,24 @@ def check_mail():
 def join_subreddit(subreddit):
     global SUBREDDIT_LIST
 
-    if subreddit.quarantine:
+    try:
+        if subreddit.quarantine:
+            return False, "quarantined"
+        elif subreddit.subreddit_type not in ["public", "restricted", "gold_only", "user"]:
+            return False, subreddit.subreddit_type
+    except prawcore.exceptions.Forbidden:
         return False, "quarantined"
-    elif subreddit.subreddit_type not in ["public", "restricted", "gold_only", "user"]:
-        return False, subreddit.subreddit_type
+    except prawcore.exceptions.NotFound:
+        return False, "banned"
+    except Exception as e:
+        logging.error("exception retrieving attributes of /r/{}: {}".format(subreddit, e))
+        return False, "error"
 
     try:
         subreddit.mod.accept_invite()
-        SUBREDDIT_LIST.append(subreddit.display_name)
+        SUBREDDIT_LIST.append(subreddit)
     except Exception as e:
-        logging.error("exception joining /r/{}: {}".format(subreddit.display_name, e))
+        logging.error("exception joining /r/{}: {}".format(subreddit, e))
         return False, "error"
     else:
         return True, None
