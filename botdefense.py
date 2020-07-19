@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 import praw
 import prawcore.exceptions
+import yaml
 
 
 # setup
@@ -42,48 +43,50 @@ COMMENT_IDS = []
 SUBMISSION_IDS = []
 QUEUE_IDS = []
 LOG_IDS = []
-FREQUENCY = {
-    "kill_switch": 60,
-    "update_status": 300,
-    "friend_list": 600,
-    "load_subreddits": 3600,
-    "check_comments": 5,
-    "check_submissions": 30,
-    "check_queue": 60,
-    "check_mail": 120,
-    "check_contributions": 60,
-    "check_unbans": 15,
-    "check_state": 300,
-}
-LAST = {}
-BAN_MESSAGE = ("Bots are not welcome on /r/{1}.\n\n"
+MODMAIL_IDS = []
+DEFAULTS = { "modmail_mute": True, "modmail_notes": False }
+BAN_MESSAGE = ("Bots are not welcome on /r/{0}.\n\n"
                "[I am a bot, and this action was performed automatically]"
-               "(/r/{0}/about/sticky). "
-               "If you wish to dispute whether this account is a bot, please "
-               "[contact the moderators of /r/{0}]"
+               "(/r/{1}/about/sticky). "
+               "If you wish to dispute whether /u/{2} is a bot, please "
+               "[contact the moderators of /r/{1}]"
                "(https://www.reddit.com/message/compose?"
-               "to=/r/{0}&subject=Ban%20dispute%20for%20/u/{2}%20on%20/r/{1}) "
+               "to=/r/{1}&subject=Ban%20dispute%20for%20/u/{2}%20on%20/r/{0}) "
                "rather than replying to this message.")
 PERMISSIONS_MESSAGE = ("Thank you for adding {}!\n\n"
                        "This bot works best with `access` and `posts` permissions "
                        "(current permissions: {}). "
                        "For more information, [please read this guide](/r/{}/about/sticky).")
+NOTE_SHORT = ("/u/{0} is [currently classified as **{1}**]({2}).\n")
+NOTE_LONG = ("Private Moderator Note: /u/{0} is [listed on /r/{1}]({2}).\n\n"
+             "- If this account is claiming to be human and isn't an obvious novelty account, "
+             "we recommend asking the account owner to [contact the moderators of /r/{1}]"
+             "(https://www.reddit.com/message/compose?"
+             "to=/r/{1}&subject=Ban%20dispute%20for%20/u/{0}%20on%20/r/{3}).\n"
+             "- If this account is a bot that you wish to allow, remember to [whitelist]"
+             "(/r/{1}/about/sticky) it before you unban it.")
 UNBAN_STATE = {}
 
 
-def ready(key, force=False):
-    global LAST
+def schedule(function, schedule=None, when=None):
+    if schedule is not None:
+        SCHEDULE[function] = schedule
+    if when == "defer":
+        NEXT[function] = time.time() + SCHEDULE[function]
+    elif when == "next":
+        NEXT[function] = 0
 
-    if force or LAST.get(key, 0) < time.time() - FREQUENCY.get(key, 60):
-        LAST[key] = time.time()
-        return True
-    return False
+
+def run():
+    now = time.time()
+    next_function = min(NEXT, key=NEXT.get)
+    if NEXT[next_function] > now:
+        time.sleep(NEXT[next_function] - now)
+    next_function()
+    NEXT[next_function] = time.time() + SCHEDULE[next_function]
 
 
-def kill_switch(force=False):
-    if not ready("kill_switch", force=force):
-        return
-
+def kill_switch():
     logging.info("checking kill switch")
     active = False
     counter = 0
@@ -132,9 +135,6 @@ def relative_time(when):
 def update_status():
     global STATUS_POST
 
-    if not ready("update_status"):
-        return
-
     logging.info("updating status")
     if not STATUS_POST:
         for result in HOME.search('title:"{} status"'.format(ME), sort='new'):
@@ -150,36 +150,31 @@ def update_status():
     recent_logs = ""
     try:
         current_time = absolute_time(time.time())
-        for log in r.subreddit("mod").mod.log(mod=ME, limit=500):
+        for log in r.subreddit("mod").mod.log(mod=ME, action="banuser", limit=500):
             if not last_time:
                 last_time = absolute_time(log.created_utc)
                 last_type = log.action
             if log.created_utc < time.time() - 86400:
                 break
-            if log.action in ["banuser", "spamcomment"]:
-                recent_logs += "|{}|{}|/u/{}|\n".format(relative_time(log.created_utc),
-                                                        log.action, log.target_author)
+            recent_logs += "|{}|/r/{}|/u/{}|\n".format(relative_time(log.created_utc),
+                                                       log.subreddit, log.target_author)
 
         if recent_logs:
-            recent_logs = "|Time|Action|Account|\n|-|-|-|\n" + recent_logs
+            recent_logs = "|Time|Subreddit|Banned|\n|-|-|-|\n" + recent_logs
         STATUS_POST.edit("|Attribute|Value|\n"
                          "|-|-|\n"
                          "|Current time|{}|\n"
-                         "|Last action time|{}|\n"
-                         "|Last action type|{}|\n"
+                         "|Last ban|{}|\n"
                          "\n&nbsp;\n&nbsp;\n\n{}"
-                         .format(current_time,
-                                 last_time,
-                                 last_type,
-                                 recent_logs))
+                         .format(current_time, last_time, recent_logs))
     except Exception as e:
         logging.error("unable to update status: {}".format(e))
 
 
-def friend_list(force=False):
+def friend_list(cached=False):
     global FRIEND_LIST
 
-    if not ready("friend_list", force=force):
+    if cached and FRIEND_LIST:
         return FRIEND_LIST
 
     logging.info("loading friends")
@@ -189,11 +184,27 @@ def friend_list(force=False):
     return FRIEND_LIST
 
 
-def load_subreddits(force=False):
-    global SUBREDDIT_LIST
+def option(subreddit, name):
+    configuration = load_configuration(subreddit)
+    return configuration.get(name)
 
-    if not ready("load_subreddits", force=force):
-        return
+
+def load_configuration(subreddit):
+    configuration = DEFAULTS
+    try:
+        wiki = subreddit.wiki[ME.lower()]
+        if wiki and 0 < len(wiki.content_md) < 256:
+            configuration = yaml.safe_load(wiki.content_md)
+            logging.info("loaded configuration for /r/{}".format(subreddit))
+    except (prawcore.exceptions.Forbidden, prawcore.exceptions.NotFound) as e:
+        logging.debug("unable to read configuration for /r/{}: {}".format(subreddit, e))
+    except Exception as e:
+        logging.error("exception loading configuration for /r/{}: {}".format(subreddit, e))
+    return configuration
+
+
+def load_subreddits():
+    global SUBREDDIT_LIST
 
     logging.info("loading subreddits")
     SUBREDDIT_LIST = r.user.me().moderated()
@@ -203,9 +214,6 @@ def load_subreddits(force=False):
 
 def check_comments():
     global COMMENT_IDS
-
-    if not ready("check_comments"):
-        return
 
     logging.info("checking comments")
     for comment in SCAN.comments(limit=100):
@@ -224,9 +232,6 @@ def check_comments():
 def check_submissions():
     global SUBMISSION_IDS
 
-    if not ready("check_submissions"):
-        return
-
     logging.info("checking submissions")
     for submission in SCAN.new(limit=100):
         if str(submission.id) in SUBMISSION_IDS:
@@ -244,14 +249,11 @@ def check_submissions():
 def check_queue():
     global QUEUE_IDS
 
-    if not ready("check_queue"):
-        return
-
     logging.info("checking queue")
     for submission in r.subreddit("mod").mod.modqueue(limit=100, only="submissions"):
         if str(submission.id) in QUEUE_IDS:
             continue
-        if submission.author in friend_list():
+        if submission.author in friend_list(cached=True):
             link = "https://www.reddit.com/comments/" + str(submission.id)
             logging.info("queue hit for /u/{} in /r/{} at {}".format(submission.author,
                                                                      submission.subreddit, link))
@@ -278,62 +280,55 @@ def consider_action(post, link):
     except Exception as e:
         logging.error("error checking moderator permissions in /r/{}: {}".format(sub, e))
 
-    is_friended = False
     if is_friend(account):
-        is_friended = True
         logging.info("/u/{} confirmed to be on friends list".format(account))
     else:
         logging.error("/u/{} is not on friends list".format(account))
+        return False
 
-    is_proof_flaired = False
     try:
         if re.search("proof\\b", str(post.author_flair_css_class)):
-            is_proof_flaired = True
             logging.info("/u/{} is whitelisted via flair class in /r/{}".format(account, sub))
+            return False
     except Exception as e:
-        logging.error("error checking flair class for /u/{} in /r/{}: {}".format(account, sub, e))
+        logging.error("error checking flair class, failing safe for /u/{} in /r/{}: {}".format(account, sub, e))
+        return False
 
-    is_contributor = False
     try:
         for contributor in sub.contributor(account):
-            is_contributor = True
             logging.info("/u/{} is whitelisted via approved users in /r/{}".format(account, sub))
+            return False
     except Exception as e:
         logging.info("unable to check approved users for /u/{} in /r/{}: {}".format(account, sub, e))
         # fail safe
         if not permissions or "access" in permissions or "all" in permissions:
-            is_contributor = True
             logging.error("failing safe for /u/{} in /r/{}".format(account, sub))
+            return False
 
-    is_moderator = False
     try:
         if sub.moderator(account):
-            is_moderator = True
             logging.info("/u/{} is whitelisted via moderator list in /r/{}".format(account, sub))
+            return False
     except Exception as e:
         # fail safe
-        is_moderator = True
         logging.error("error checking moderator list, failing safe for /u/{} in /r/{}: {}".format(account, sub, e))
+        return False
 
-    if is_friended and not is_proof_flaired and not is_contributor and not is_moderator:
-        kill_switch()
-        if "access" in permissions or "all" in permissions:
-            ban(account, sub, link, ("mail" in permissions))
-        if "posts" in permissions or "all" in permissions:
-            try:
-                if not post.banned_by:
-                    logging.info("removing " + link)
-                    post.mod.remove(spam=True)
-            except Exception as e:
-                logging.error("error removing {}: {}".format(link, e))
-        elif permissions:
-            try:
-                post.report("bot (moderator permissions limited to reporting)")
-            except Exception as e:
-                logging.error("error reporting {}: {}".format(link, e))
-        return True
-
-    return False
+    if "access" in permissions or "all" in permissions:
+        ban(account, sub, link, ("mail" in permissions))
+    if "posts" in permissions or "all" in permissions:
+        try:
+            if not post.banned_by:
+                logging.info("removing " + link)
+                post.mod.remove(spam=True)
+        except Exception as e:
+            logging.error("error removing {}: {}".format(link, e))
+    elif permissions:
+        try:
+            post.report("bot (moderator permissions limited to reporting)")
+        except Exception as e:
+            logging.error("error reporting {}: {}".format(link, e))
+    return True
 
 
 def is_friend(user):
@@ -355,7 +350,7 @@ def is_friend(user):
     return None
 
 
-def ban(account, sub, link, mute):
+def ban(account, sub, link, mail):
     already_banned = False
     logging.info("banning /u/{} in /r/{}".format(account, sub))
     try:
@@ -368,10 +363,10 @@ def ban(account, sub, link, mute):
         date = str(datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d"))
         try:
             sub.banned.add(
-                account, ban_message=BAN_MESSAGE.format(HOME, sub, account),
+                account, ban_message=BAN_MESSAGE.format(sub, HOME, account),
                 note="/u/{} banned by /u/{} at {} for {}".format(account, ME, date, link))
             logging.info("banned /u/{} in /r/{}".format(account, sub))
-            if mute:
+            if mail and option(sub, "modmail_mute"):
                 logging.info("muting /u/{} in /r/{}".format(account, sub))
                 sub.muted.add(account)
         except Exception as e:
@@ -395,16 +390,38 @@ def unban(account, sub):
         logging.warning("error checking ban for /u/{} in /r/{}: {}".format(account, sub, e))
 
 
-def check_contributions():
-    if not ready("check_contributions"):
-        return
+def find_canonical(name, fast=False):
+    title = "overview for " + name
+    url = "https://www.reddit.com/user/" + name
 
+    for query in "url:\"{}\"".format(url), "title:\"{}\"".format(name):
+        try:
+            for similar in HOME.search(query):
+                if similar.title == title and similar.author == ME:
+                    return similar
+        except Exception as e:
+            logging.error("exception searching {} for canonical post: {}".format(query, e))
+
+    if fast:
+        return None
+
+    try:
+        for recent in HOME.new(limit=1000):
+            if recent.title == title and recent.author == ME:
+                return recent
+    except Exception as e:
+        logging.error("exception checking recent posts for canonical post: {}".format(e))
+
+    return None
+
+
+def check_contributions():
     logging.info("checking for contributions")
     for submission in HOME.new(limit=100):
         if submission.author == ME:
             continue
 
-        if is_friend(submission.author):
+        if submission.author in friend_list(cached=True):
             logging.info("contribution from friend /u/{}".format(submission.author))
             link = "https://www.reddit.com/comments/" + str(submission.id)
             if consider_action(submission, link):
@@ -412,7 +429,6 @@ def check_contributions():
 
         account = None
         name = None
-        canonical = None
         post = None
 
         if submission.url:
@@ -442,31 +458,11 @@ def check_contributions():
             logging.info("contribution {} from /u/{} rejected".format(submission.permalink, submission.author))
             continue
 
-        title = "overview for " + name
-        url = "https://www.reddit.com/user/" + name
-
-        for query in "url:\"{}\"".format(url), "title:\"{}\"".format(name):
-            try:
-                for similar in HOME.search(query):
-                    if similar.title == title and similar.author == ME:
-                        canonical = similar
-                        break
-                if canonical:
-                    break
-            except Exception as e:
-                logging.error("exception searching {} for canonical post: {}".format(query, e))
-
+        canonical = find_canonical(name)
         try:
             if not canonical:
-                for recent in HOME.new(limit=1000):
-                    if recent.title == title and recent.author == ME:
-                        canonical = recent
-                        break
-        except Exception as e:
-            logging.error("exception checking recent posts for canonical post: {}".format(e))
-
-        try:
-            if not canonical:
+                title = "overview for " + name
+                url = "https://www.reddit.com/user/" + name
                 post = HOME.submit(title, url=url)
                 post.report("Reviewable submission from /u/{}: please approve and update flair".format(submission.author))
                 post.disable_inbox_replies()
@@ -492,9 +488,6 @@ def check_contributions():
 
 
 def check_mail():
-    if not ready("check_mail"):
-        return
-
     logging.info("checking mail")
     for message in r.inbox.unread(limit=10):
         try:
@@ -550,7 +543,8 @@ def check_mail():
             # looks like a removal
             elif re.search("^/?u/[\w-]+ has been removed as a moderator from /?(r|u|user)/[\w-]+$", str(message.subject)):
                 message.mark_read()
-                load_subreddits(force=True)
+                load_subreddits()
+                schedule(load_subreddits, when="defer")
                 if sub not in SUBREDDIT_LIST:
                     logging.info("removed as moderator from /r/" + sub)
             # some other type of subreddit message
@@ -558,6 +552,78 @@ def check_mail():
                 message.mark_read()
         except Exception as e:
             logging.error("exception checking mail: {}".format(e))
+
+
+def check_modmail():
+    global MODMAIL_IDS
+
+    logging.info("checking modmail")
+    for thread in r.subreddit("all").modmail.conversations(limit=25):
+        id = ":".join([str(thread.id), str(thread.last_mod_update), str(thread.last_user_update)])
+        if id in MODMAIL_IDS:
+            continue
+        MODMAIL_IDS.append(id)
+
+        try:
+            account = None
+            banned = False
+            # fastest checks
+            if thread.is_auto and thread.num_messages == 1:
+                continue
+            if thread.is_internal or not thread.is_repliable:
+                continue
+            try:
+                if thread.participant:
+                    account = thread.participant
+                else:
+                    account = thread.user
+            except:
+                continue
+            if not account or account not in friend_list(cached=True):
+                continue
+            # handled check
+            if ME in thread.authors:
+                if next((m for m in thread.messages if m.author == ME and m.is_internal), None):
+                    continue
+            # home check
+            if thread.owner == HOME:
+                canonical = find_canonical(str(account), fast=True)
+                if canonical and canonical.link_flair_text:
+                    logging.info("creating note about /u/{} on /r/{}".format(account, thread.owner))
+                    note = NOTE_SHORT.format(account, canonical.link_flair_text, canonical.permalink)
+                    try:
+                        mod_reports = canonical.mod_reports_dismissed + canonical.mod_reports
+                    except AttributeError:
+                        mod_reports = canonical.mod_reports
+                    for reason, moderator in mod_reports:
+                        if moderator == ME:
+                            m = re.search("\\bsubmission from (/u/[\w-]{3,20})", reason)
+                            if m:
+                                note += "\n- Submission from {}".format(m.group(1))
+                        elif not re.search("^(ignore|show|test)\\b.{0,16}$", reason, re.I):
+                            note += "\n- {}: {}\n".format(moderator, reason)
+                    thread.reply(note, internal=True)
+                continue
+            # banned check
+            for ban in thread.owner.banned(account):
+                if ban.note and re.search(ME, ban.note):
+                    banned = True
+            if not banned:
+                continue
+            # option check
+            if not option(thread.owner, "modmail_notes"):
+                continue
+            # create note
+            canonical = find_canonical(str(account), fast=True)
+            if canonical:
+                logging.info("creating note about /u/{} on /r/{}".format(account, thread.owner))
+                thread.reply(NOTE_LONG.format(account, HOME, canonical.permalink, thread.owner), internal=True)
+        except Exception as e:
+            logging.error("exception checking modmail {}: {}".format(thread.id, e))
+
+    # trim cache
+    if len(MODMAIL_IDS) > 50:
+        MODMAIL_IDS = MODMAIL_IDS[-50:]
 
 
 def join_subreddit(subreddit):
@@ -589,9 +655,6 @@ def join_subreddit(subreddit):
 def check_state():
     global LOG_IDS
 
-    if not ready("check_state"):
-        return
-
     logging.info("checking state")
     try:
         friends = []
@@ -602,14 +665,16 @@ def check_state():
                 continue
             # cache friends and recent submissions
             if not friends:
-                friends = friend_list(force=True)
+                friends = friend_list()
+                schedule(friend_list, when="defer")
                 for submission in HOME.new(limit=100):
                     recent[str(submission)] = submission
             try:
                 if log.target_author == ME and log.target_fullname.startswith("t3_"):
                     entry = log.target_fullname[3:]
                     if sync_submission(recent.get(entry, r.submission(id=entry)), friends):
-                        friends = friend_list(force=True)
+                        friends = friend_list()
+                        schedule(friend_list, when="defer")
                 # we only cache non-recent log identifiers after processing successfully
                 if log.created_utc < time.time() - 600:
                     LOG_IDS.append(str(log.id))
@@ -624,9 +689,12 @@ def check_state():
             for flair in HOME.flair():
                 if flair.get("user") and "unban" in flair.get("flair_css_class"):
                     UNBAN_STATE[flair.get("user")] = list(SUBREDDIT_LIST)
+                    schedule(check_unbans, schedule=15, when="next")
+        # this is like a free kill_switch check
+        schedule(kill_switch, when="defer")
     except Exception as e:
         logging.error("exception checking for pending unbans: {}".format(e))
-        kill_switch(force=True)
+        schedule(kill_switch, when="next")
 
     # trim cache
     if len(LOG_IDS) > 200:
@@ -665,9 +733,6 @@ def sync_submission(submission, friends):
 
 
 def check_unbans():
-    if not ready("check_unbans"):
-        return
-
     logging.info("checking unbans")
     if not UNBAN_STATE:
         return
@@ -680,27 +745,32 @@ def check_unbans():
         if not UNBAN_STATE[account]:
             logging.info("finished unban for /u/{}".format(account))
             HOME.flair.delete(account)
+            schedule(check_unbans, schedule=86400, when="defer")
             del UNBAN_STATE[account]
     except Exception as e:
         logging.error("exception checking unbans: {}".format(e))
 
 
-def run():
-    update_status()
-    load_subreddits()
-    check_comments()
-    check_submissions()
-    check_queue()
-    check_mail()
-    check_contributions()
-    check_unbans()
-    check_state()
-    time.sleep(1)
-
-
 if __name__ == "__main__":
+    SCHEDULE = {
+        kill_switch: 120,
+        load_subreddits: 3600,
+        check_comments: 5,
+        check_submissions: 30,
+        check_queue: 60,
+        check_mail: 120,
+        check_modmail: 30,
+        check_contributions: 60,
+        check_unbans: 86400,
+        check_state: 300,
+        friend_list: 600,
+        update_status: 600,
+    }
+    NEXT = SCHEDULE.copy()
+    schedule(kill_switch, when="next")
+    schedule(load_subreddits, when="next")
+
     logging.info("starting")
-    kill_switch()
     while True:
         try:
             run()
@@ -709,5 +779,5 @@ if __name__ == "__main__":
             sys.exit(1)
         except Exception as e:
             logging.error("site error: {}".format(e))
-            time.sleep(60)
+            time.sleep(10 if min(NEXT.values()) > max(SCHEDULE.values()) else 60)
             sys.exit(1)
