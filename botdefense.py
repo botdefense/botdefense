@@ -318,7 +318,7 @@ def consider_action(post, link):
         ban(account, sub, link, ("mail" in permissions))
     if "posts" in permissions or "all" in permissions:
         try:
-            if not post.banned_by:
+            if not getattr(post, "removed", None) and not getattr(post, "spam", None):
                 logging.info("removing " + link)
                 post.mod.remove(spam=True)
         except Exception as e:
@@ -351,26 +351,25 @@ def is_friend(user):
 
 
 def ban(account, sub, link, mail):
-    already_banned = False
     logging.info("banning /u/{} in /r/{}".format(account, sub))
     try:
         for ban in sub.banned(account):
             logging.info("/u/{} already banned in /r/{}".format(account, sub))
-            already_banned = True
+            return
     except Exception as e:
         logging.error("error checking ban status for /u/{} in /r/{}: {}".format(account, sub, e))
-    if not already_banned:
+
+    try:
         date = str(datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d"))
-        try:
-            sub.banned.add(
-                account, ban_message=BAN_MESSAGE.format(sub, HOME, account),
-                note="/u/{} banned by /u/{} at {} for {}".format(account, ME, date, link))
-            logging.info("banned /u/{} in /r/{}".format(account, sub))
-            if mail and option(sub, "modmail_mute"):
-                logging.info("muting /u/{} in /r/{}".format(account, sub))
-                sub.muted.add(account)
-        except Exception as e:
-            logging.error("error banning /u/{} in /r/{}: {}".format(account, sub, e))
+        sub.banned.add(
+            account, ban_message=BAN_MESSAGE.format(sub, HOME, account),
+            note="/u/{} banned by /u/{} at {} for {}".format(account, ME, date, link))
+        logging.info("banned /u/{} in /r/{}".format(account, sub))
+        if mail and option(sub, "modmail_mute"):
+            logging.info("muting /u/{} in /r/{}".format(account, sub))
+            sub.muted.add(account)
+    except Exception as e:
+        logging.error("error banning /u/{} in /r/{}: {}".format(account, sub, e))
 
 
 def unban(account, sub):
