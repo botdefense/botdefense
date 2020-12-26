@@ -150,21 +150,21 @@ def update_status():
     recent_logs = ""
     try:
         current_time = absolute_time(time.time())
-        for log in r.subreddit("mod").mod.log(mod=ME, action="banuser", limit=500):
+        for log in HOME.mod.log(mod=ME, limit=500):
             if not last_time:
                 last_time = absolute_time(log.created_utc)
                 last_type = log.action
             if log.created_utc < time.time() - 86400:
                 break
-            recent_logs += "|{}|/r/{}|/u/{}|\n".format(relative_time(log.created_utc),
-                                                       log.subreddit, log.target_author)
+            recent_logs += "|{}|/r/{}|{}|\n".format(relative_time(log.created_utc),
+                                                    log.subreddit, log.action)
 
         if recent_logs:
-            recent_logs = "|Time|Subreddit|Banned|\n|-|-|-|\n" + recent_logs
+            recent_logs = "|Time|Subreddit|Action|\n|-|-|-|\n" + recent_logs
         STATUS_POST.edit("|Attribute|Value|\n"
                          "|-|-|\n"
                          "|Current time|{}|\n"
-                         "|Last ban|{}|\n"
+                         "|Last action|{}|\n"
                          "\n&nbsp;\n&nbsp;\n\n{}"
                          .format(current_time, last_time, recent_logs))
     except Exception as e:
@@ -766,17 +766,17 @@ if __name__ == "__main__":
         update_status: 600,
     }
     NEXT = SCHEDULE.copy()
-    schedule(kill_switch, when="next")
-    schedule(load_subreddits, when="next")
 
-    logging.info("starting")
-    while True:
-        try:
+    try:
+        logging.info("starting")
+        schedule(kill_switch, when="next")
+        schedule(load_subreddits, when="next")
+        while True:
             run()
-        except KeyboardInterrupt:
-            logging.error("received SIGINT from keyboard, stopping")
-            sys.exit(1)
-        except Exception as e:
-            logging.error("site error: {}".format(e))
-            time.sleep(10 if min(NEXT.values()) > max(SCHEDULE.values()) else 60)
-            sys.exit(1)
+    except KeyboardInterrupt:
+        logging.error("received SIGINT from keyboard, stopping")
+        sys.exit(1)
+    except Exception as e:
+        logging.error("site error: {}".format(e))
+        time.sleep(10 if min(NEXT.values()) > max(SCHEDULE.values()) else 60)
+        sys.exit(1)
