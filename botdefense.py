@@ -192,8 +192,10 @@ def friend_list(cached=False):
         return FRIEND_LIST
 
     logging.info("loading friends")
-    FRIEND_LIST = set(r.user.friends())
-    if not FRIEND_LIST:
+    friends = set(r.user.friends())
+    if friends:
+        FRIEND_LIST = friends
+    else:
         raise RuntimeError("empty friends list")
     return FRIEND_LIST
 
@@ -221,8 +223,10 @@ def load_subreddits():
     global SUBREDDIT_LIST
 
     logging.info("loading subreddits")
-    SUBREDDIT_LIST = set(r.user.me().moderated())
-    if not SUBREDDIT_LIST:
+    subreddits = set(r.user.me().moderated())
+    if subreddits:
+        SUBREDDIT_LIST = subreddits
+    else:
         raise RuntimeError("empty subreddit list")
 
 
@@ -231,16 +235,18 @@ def check_comments():
     global COMMENT_CACHE
 
     logging.info("checking comments (after {}, cache {})".format(COMMENT_AFTER, len(COMMENT_CACHE)))
-
     comment = None
-    for after in [None, COMMENT_AFTER] if COMMENT_AFTER else [None]:
-        for comment in SCAN.comments(limit=100, params={"after": after}):
-            if str(comment.id) in COMMENT_CACHE:
-                continue
-            link = "https://www.reddit.com/comments/{}/_/{}".format(comment.submission.id, comment.id)
-            consider_action(comment, link)
-            # we only cache identifiers after processing successfully
-            COMMENT_CACHE[str(comment.id)] = comment.created_utc
+    try:
+        for after in [None, COMMENT_AFTER] if COMMENT_AFTER else [None]:
+            for comment in SCAN.comments(limit=100, params={"after": after}):
+                if str(comment.id) in COMMENT_CACHE:
+                    continue
+                link = "https://www.reddit.com/comments/{}/_/{}".format(comment.submission.id, comment.id)
+                consider_action(comment, link)
+                # we only cache identifiers after processing successfully
+                COMMENT_CACHE[str(comment.id)] = comment.created_utc
+    except Exception as e:
+        logging.error("exception checking comments: {}".format(e))
 
     COMMENT_AFTER = comment.fullname if comment and comment.created_utc > time.time() - 3600 else None
 
@@ -249,13 +255,16 @@ def check_submissions():
     global SUBMISSION_IDS
 
     logging.info("checking submissions")
-    for submission in SCAN.new(limit=100):
-        if str(submission.id) in SUBMISSION_IDS:
-            continue
-        link = "https://www.reddit.com/comments/{}".format(submission.id)
-        consider_action(submission, link)
-        # we only cache identifiers after processing successfully
-        SUBMISSION_IDS.append(str(submission.id))
+    try:
+        for submission in SCAN.new(limit=100):
+            if str(submission.id) in SUBMISSION_IDS:
+                continue
+            link = "https://www.reddit.com/comments/{}".format(submission.id)
+            consider_action(submission, link)
+            # we only cache identifiers after processing successfully
+            SUBMISSION_IDS.append(str(submission.id))
+    except Exception as e:
+        logging.error("exception checking submissions: {}".format(e))
 
     # trim cache
     if len(SUBMISSION_IDS) > 200:
@@ -266,16 +275,19 @@ def check_queue():
     global QUEUE_IDS
 
     logging.info("checking queue")
-    for submission in r.subreddit("mod").mod.modqueue(limit=100, only="submissions"):
-        if str(submission.id) in QUEUE_IDS:
-            continue
-        if submission.author in friend_list(cached=True):
-            link = "https://www.reddit.com/comments/{}".format(submission.id)
-            logging.info("queue hit for /u/{} in /r/{} at {}".format(submission.author,
-                                                                     submission.subreddit, link))
-            consider_action(submission, link)
-        # we only cache identifiers after processing successfully
-        QUEUE_IDS.append(str(submission.id))
+    try:
+        for submission in r.subreddit("mod").mod.modqueue(limit=100, only="submissions"):
+            if str(submission.id) in QUEUE_IDS:
+                continue
+            if submission.author in friend_list(cached=True):
+                link = "https://www.reddit.com/comments/{}".format(submission.id)
+                logging.info("queue hit for /u/{} in /r/{} at {}".format(submission.author,
+                                                                         submission.subreddit, link))
+                consider_action(submission, link)
+            # we only cache identifiers after processing successfully
+            QUEUE_IDS.append(str(submission.id))
+    except Exception as e:
+        logging.error("exception checking queue: {}".format(e))
 
     # trim cache
     if len(QUEUE_IDS) > 200:
@@ -514,8 +526,8 @@ def check_contributions():
 
 def check_mail():
     logging.info("checking mail")
-    for message in r.inbox.unread(limit=10):
-        try:
+    try:
+        for message in r.inbox.unread(limit=10):
             # skip non-messages and some accounts
             if not message.fullname.startswith("t4_") or message.author in ["mod_mailer", "reddit"]:
                 message.mark_read()
@@ -533,10 +545,13 @@ def check_mail():
             if re.search("^invitation to moderate /?(r|u|user)/[\w-]+$", str(message.subject)):
                 logging.info("invited to moderate /r/{}".format(subreddit))
 
-                try:
-                    result, reason = join_subreddit(subreddit)
-                except:
-                    result, reason = False, "error"
+                for attempt in range(3):
+                    try:
+                        result, reason = join_subreddit(subreddit)
+                        if result or reason != "error":
+                            break
+                    except:
+                        result, reason = False, "error"
 
                 if result:
                     message.mark_read()
@@ -575,21 +590,21 @@ def check_mail():
             # some other type of subreddit message
             else:
                 message.mark_read()
-        except Exception as e:
-            logging.error("exception checking mail: {}".format(e))
+    except Exception as e:
+        logging.error("exception checking mail: {}".format(e))
 
 
 def check_modmail():
     global MODMAIL_IDS
 
     logging.info("checking modmail")
-    for thread in r.subreddit("all").modmail.conversations(limit=25):
-        id = ":".join([str(thread.id), str(thread.last_mod_update), str(thread.last_user_update)])
-        if id in MODMAIL_IDS:
-            continue
-        MODMAIL_IDS.append(id)
-
-        try:
+    thread = None
+    try:
+        for thread in r.subreddit("all").modmail.conversations(limit=25):
+            id = ":".join([str(thread.id), str(thread.last_mod_update), str(thread.last_user_update)])
+            if id in MODMAIL_IDS:
+                continue
+            MODMAIL_IDS.append(id)
             account = None
             banned = False
             # fastest checks
@@ -643,8 +658,8 @@ def check_modmail():
             if canonical:
                 logging.info("creating note about /u/{} on /r/{}".format(account, thread.owner))
                 thread.reply(NOTE_LONG.format(account, HOME, canonical.permalink, thread.owner), internal=True)
-        except Exception as e:
-            logging.error("exception checking modmail {}: {}".format(thread.id, e))
+    except Exception as e:
+        logging.error("exception checking modmail {}: {}".format(thread, e))
 
     # trim cache
     if len(MODMAIL_IDS) > 50:
