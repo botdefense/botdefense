@@ -574,7 +574,9 @@ def check_mail():
                     message.mark_read()
                     if reason == "error":
                         logging.info("failure accepting invite {} from /r/{}".format(message.fullname, subreddit))
-                    elif reason and reason != "banned":
+                    elif reason == "moderator":
+                        logging.info("already moderator on /r/{}".format(subreddit))
+                    elif reason != "banned":
                         logging.info("declining invite from {} subreddit /r/{}".format(reason, subreddit))
                         message.reply(
                             "This bot isn't really needed on non-public subreddits due to very limited bot"
@@ -686,6 +688,8 @@ def join_subreddit(subreddit):
         subreddit.mod.accept_invite()
         SUBREDDIT_LIST.add(subreddit)
     except Exception as e:
+        if e.items[0].error_type == "NO_INVITE_FOUND" and subreddit.moderator(ME):
+            return False, "moderator"
         logging.error("exception joining /r/{}: {}".format(subreddit, e))
         return False, "error"
     else:
