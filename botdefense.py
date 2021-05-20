@@ -440,10 +440,12 @@ def find_canonical(name, fast=False):
             logging.error("exception searching {} for canonical post: {}".format(query, e))
 
     if fast:
-        return None
+        limit = 100
+    else:
+        limit = 1000
 
     try:
-        for recent in HOME.new(limit=1000):
+        for recent in HOME.new(limit=limit):
             if recent.title == title and recent.author == ME:
                 return recent
     except Exception as e:
@@ -602,7 +604,7 @@ def check_modmail():
     logging.info("checking modmail")
     thread = None
     try:
-        for thread in r.subreddit("all").modmail.conversations(limit=25):
+        for thread in r.subreddit("all").modmail.conversations(limit=100):
             id = ":".join([str(thread.id), str(thread.last_mod_update), str(thread.last_user_update)])
             if id in MODMAIL_IDS:
                 continue
@@ -637,13 +639,16 @@ def check_modmail():
                         mod_reports = canonical.mod_reports_dismissed + canonical.mod_reports
                     except AttributeError:
                         mod_reports = canonical.mod_reports
-                    for reason, moderator in mod_reports:
+                    for report, moderator in mod_reports:
                         if moderator == ME:
-                            m = re.search("\\bsubmission from (/u/[\w-]{3,20})", reason)
+                            contributor = ""
+                            m = re.search("\\bsubmission from (/u/[\w-]{3,20})", report)
                             if m:
-                                note += "\n- Submission from {}".format(m.group(1))
-                        elif not re.search("^(ignore|show|test)\\b.{0,16}$", reason, re.I):
-                            note += "\n- {}: {}\n".format(moderator, reason)
+                                contributor = "from {} ".format(m.group(1))
+                            created = absolute_time(canonical.created_utc)
+                            note += "\n- Submission {}posted {}".format(contributor, created)
+                        elif not re.search("^(ignore|show|test)\\b.{0,16}$", report, re.I):
+                            note += "\n- {}: {}\n".format(moderator, report)
                     thread.reply(note, internal=True)
                 continue
             # banned check
@@ -664,8 +669,8 @@ def check_modmail():
         logging.error("exception checking modmail {}: {}".format(thread, e))
 
     # trim cache
-    if len(MODMAIL_IDS) > 50:
-        MODMAIL_IDS = MODMAIL_IDS[-50:]
+    if len(MODMAIL_IDS) > 200:
+        MODMAIL_IDS = MODMAIL_IDS[-200:]
 
 
 def join_subreddit(subreddit):
@@ -777,7 +782,8 @@ def sync_submission(submission):
             try:
                 user.unfriend()
                 logging.info("removed friend /u/{}".format(user))
-                HOME.flair.set(user, css_class="unban")
+                if submission.link_flair_text != "inactive":
+                    HOME.flair.set(user, css_class="unban")
             except Exception as e:
                 logging.error("error removing friend /u/{}: {}".format(user, e))
             return True
