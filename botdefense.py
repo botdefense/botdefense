@@ -740,7 +740,10 @@ def check_state():
         if not UNBAN_STATE:
             for flair in HOME.flair():
                 if flair.get("user") and "unban" in flair.get("flair_css_class"):
-                    UNBAN_STATE[flair.get("user")] = list(SUBREDDIT_LIST)
+                    subreddits = r.user.me().moderated()
+                    if not subreddits:
+                        raise RuntimeError("empty subreddit list")
+                    UNBAN_STATE[flair.get("user")] = subreddits
                     schedule(check_unbans, schedule=15, when="next")
         # this is like a free kill_switch check
         schedule(kill_switch, when="defer")
@@ -782,7 +785,7 @@ def sync_submission(submission):
             try:
                 user.unfriend()
                 logging.info("removed friend /u/{}".format(user))
-                if submission.link_flair_text != "inactive":
+                if submission.link_flair_text not in ["inactive", "retired"]:
                     HOME.flair.set(user, css_class="unban")
             except Exception as e:
                 logging.error("error removing friend /u/{}: {}".format(user, e))
