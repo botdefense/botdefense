@@ -19,7 +19,7 @@ logging.basicConfig(
     datefmt='%Y-%m-%dT%H:%M:%S',
 )
 try:
-    assert praw.__version__.startswith('7.2.')
+    assert praw.__version__.startswith('7.3.')
     configuration = sys.argv[1]
     r = praw.Reddit(configuration)
     r.validate_on_submit = True
@@ -39,6 +39,7 @@ except Exception as e:
 STATUS_POST = None
 FRIEND_LIST = set()
 SUBREDDIT_LIST = set()
+MULTIREDDITS = {}
 COMMENT_AFTER = None
 COMMENT_CACHE = {}
 WHITELIST_CACHE = {}
@@ -46,27 +47,30 @@ SUBMISSION_IDS = []
 QUEUE_IDS = []
 LOG_IDS = []
 MODMAIL_IDS = []
-DEFAULTS = { "modmail_mute": True, "modmail_notes": False }
-BAN_MESSAGE = ("Bots are not welcome on /r/{0}.\n\n"
+OPTIONS_DEFAULT = { "modmail_mute": True, "modmail_notes": False }
+OPTIONS_DISABLED = { "modmail_mute": False, "modmail_notes": False }
+BAN_MESSAGE = ("Bots and bot-like accounts are not welcome on /r/{0}.\n\n"
                "[I am a bot, and this action was performed automatically]"
-               "(/r/{1}/about/sticky). "
-               "If you wish to dispute whether /u/{2} is a bot, please "
-               "[contact the moderators of /r/{1}]"
+               "(/r/{1}/wiki/index). "
+               "If you wish to appeal the classification of the /u/{2} account, please "
+               "[message /r/{1}]"
                "(https://www.reddit.com/message/compose?"
                "to=/r/{1}&subject=Ban%20dispute%20for%20/u/{2}%20on%20/r/{0}) "
                "rather than replying to this message.")
+BAN_MESSAGE_SHORT = "Bots and bot-like accounts are not welcome on /r/{}."
 PERMISSIONS_MESSAGE = ("Thank you for adding {}!\n\n"
                        "This bot works best with `access` and `posts` permissions "
                        "(current permissions: {}). "
-                       "For more information, [please read this guide](/r/{}/about/sticky).")
-NOTE_SHORT = ("/u/{0} is [currently classified as **{1}**]({2}).\n")
+                       "For more information, [please read this guide](/r/{}/wiki/index).")
+NOTE_SHORT = "/u/{0} is [currently classified as **{1}**]({2}).\n\n"
 NOTE_LONG = ("Private Moderator Note: /u/{0} is [listed on /r/{1}]({2}).\n\n"
              "- If this account is claiming to be human and isn't an obvious novelty account, "
-             "we recommend asking the account owner to [contact the moderators of /r/{1}]"
+             "we recommend asking the account owner to [message /r/{1}]"
              "(https://www.reddit.com/message/compose?"
              "to=/r/{1}&subject=Ban%20dispute%20for%20/u/{0}%20on%20/r/{3}).\n"
              "- If this account is a bot that you wish to allow, remember to [whitelist]"
-             "(/r/{1}/about/sticky) it before you unban it.")
+             "(/r/{1}/wiki/index) it before you unban it.")
+REPORT_REASON = "bot or bot-like account (moderator permissions limited to reporting)"
 UNBAN_STATE = {}
 
 
@@ -206,7 +210,9 @@ def option(subreddit, name):
 
 
 def load_configuration(subreddit):
-    configuration = DEFAULTS
+    if subreddit in MULTIREDDITS.get("restricted", set()):
+        return OPTIONS_DISABLED
+    configuration = OPTIONS_DEFAULT
     try:
         wiki = subreddit.wiki[ME.lower()]
         if wiki and 0 < len(wiki.content_md) < 256:
@@ -221,6 +227,7 @@ def load_configuration(subreddit):
 
 def load_subreddits():
     global SUBREDDIT_LIST
+    global MULTIREDDITS
 
     logging.info("loading subreddits")
     subreddits = set(r.user.me().moderated())
@@ -228,6 +235,10 @@ def load_subreddits():
         SUBREDDIT_LIST = subreddits
     else:
         raise RuntimeError("empty subreddit list")
+    MULTIREDDITS = {}
+    for multireddit in r.user.multireddits():
+        name = re.sub(r'\d+', '', multireddit.name)
+        MULTIREDDITS[name] = set.union(MULTIREDDITS.get(name, set()), set(multireddit.subreddits))
 
 
 def check_comments():
@@ -311,6 +322,8 @@ def consider_action(post, link):
     permissions = []
     try:
         permissions = subreddit.moderator(ME)[0].mod_permissions
+        if not permissions:
+            permissions.append("none")
     except Exception as e:
         logging.error("error checking moderator permissions in /r/{}: {}".format(subreddit, e))
 
@@ -353,17 +366,19 @@ def consider_action(post, link):
 
     if "access" in permissions or "all" in permissions:
         ban(account, subreddit, link, ("mail" in permissions))
+
+    delay = int(time.time() - post.created_utc)
     if "posts" in permissions or "all" in permissions:
         try:
             if not getattr(post, "removed", None) and not getattr(post, "spam", None):
-                delay = int(time.time() - post.created_utc)
                 logging.info("removing {} by /u/{} after {} seconds".format(link, account, delay))
                 post.mod.remove(spam=True)
         except Exception as e:
             logging.error("error removing {}: {}".format(link, e))
     elif permissions:
         try:
-            post.report("bot (moderator permissions limited to reporting)")
+            logging.info("reporting {} by /u/{} after {} seconds".format(link, account, delay))
+            post.report(REPORT_REASON)
         except Exception as e:
             logging.error("error reporting {}: {}".format(link, e))
     return True
@@ -399,9 +414,12 @@ def ban(account, subreddit, link, mail):
 
     try:
         date = str(datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d"))
-        subreddit.banned.add(
-            account, ban_message=BAN_MESSAGE.format(subreddit, HOME, account),
-            note="/u/{} banned by /u/{} at {} for {}".format(account, ME, date, link))
+        message = BAN_MESSAGE.format(subreddit, HOME, account)
+        note = "/u/{} banned by /u/{} at {} for {}".format(account, ME, date, link)
+        if subreddit in MULTIREDDITS.get("restricted", set()):
+            message = BAN_MESSAGE_SHORT.format(subreddit)
+            note = "/u/{} banned at {} for {}".format(account, date, link)
+        subreddit.banned.add(account, ban_message=message, note=note)
         logging.info("banned /u/{} in /r/{}".format(account, subreddit))
         if mail and option(subreddit, "modmail_mute"):
             logging.info("muting /u/{} in /r/{}".format(account, subreddit))
@@ -490,9 +508,9 @@ def check_contributions():
 
         if not name:
             submission.mod.remove()
-            comment = submission.reply("Thank you for your submission! That account does not appear to"
-                                       " exist (perhaps it has already been suspended, banned, or deleted),"
-                                       " but please send modmail if you believe this was an error.")
+            comment = submission.reply("Thank you for your submission! That account does not appear to exist"
+                                       " (perhaps it has already been suspended, banned, or deleted), but"
+                                       " please message /r/{} if you believe this was an error.".format(HOME))
             comment.mod.distinguish()
             logging.info("contribution {} from /u/{} rejected".format(submission.permalink, submission.author))
             continue
@@ -530,15 +548,29 @@ def check_mail():
     logging.info("checking mail")
     try:
         for message in r.inbox.unread(limit=10):
-            # skip non-messages and some accounts
-            if not message.fullname.startswith("t4_") or message.author in ["mod_mailer", "reddit"]:
-                message.mark_read()
+            # log everything in inbox
+            message_data = ["message {}".format(message.fullname)]
+            if message.author:
+                message_data.append("by /u/{}".format(message.author))
+                if message.author in friend_list(cached=True):
+                    message_data.append("(friend)")
+            if message.subreddit:
+                message_data.append("from /r/{}".format(message.subreddit))
+            logging.info(" ".join(message_data))
+
+            # skip non-messages
+            if not message.fullname.startswith("t4_"):
                 continue
-            # skip non-subreddit messages
+
+            # handle non-subreddit messages
             if not message.subreddit:
                 message.mark_read()
-                if message.distinguished != "admin":
-                    message.reply("Please modmail /r/{} if you would like to get in touch.".format(HOME))
+                if message.author in ["mod_mailer", "reddit"]:
+                    continue
+                if message.distinguished in ["admin", "gold-auto"]:
+                    continue
+                if message.author in friend_list(cached=True) or message.author.moderated():
+                    message.reply("I am a bot. If this is regarding {}, please message /r/{}. For anything else, please message the relevant subreddit.".format(ME, HOME))
                 continue
 
             subreddit = message.subreddit
@@ -578,11 +610,13 @@ def check_mail():
                         logging.info("failure accepting invite {} from /r/{}".format(message.fullname, subreddit))
                     elif reason == "moderator":
                         logging.info("already moderator on /r/{}".format(subreddit))
-                    elif reason != "banned":
+                    elif reason in ["banned", "prohibited"]:
+                        logging.warning("ignoring invite from {} subreddit /r/{}".format(reason, subreddit))
+                    else:
                         logging.info("declining invite from {} subreddit /r/{}".format(reason, subreddit))
                         message.reply(
                             "This bot isn't really needed on non-public subreddits due to very limited bot"
-                            " activity. If you believe this was sent in error, please modmail /r/{}.".format(HOME)
+                            " activity. If you believe this was sent in error, please message /r/{}.".format(HOME)
                         )
             # looks like a removal
             elif re.search("^/?u/[\w-]+ has been removed as a moderator from /?(r|u|user)/[\w-]+$", str(message.subject)):
@@ -639,6 +673,7 @@ def check_modmail():
                         mod_reports = canonical.mod_reports_dismissed + canonical.mod_reports
                     except AttributeError:
                         mod_reports = canonical.mod_reports
+                    reports = []
                     for report, moderator in mod_reports:
                         if moderator == ME:
                             contributor = ""
@@ -646,9 +681,10 @@ def check_modmail():
                             if m:
                                 contributor = "from {} ".format(m.group(1))
                             created = absolute_time(canonical.created_utc)
-                            note += "\n- Submission {}posted {}".format(contributor, created)
+                            reports.insert(0, "- Submission {}posted {}".format(contributor, created))
                         elif not re.search("^(ignore|show|test)\\b.{0,16}$", report, re.I):
-                            note += "\n- {}: {}\n".format(moderator, report)
+                            reports.append("- {}: {}".format(moderator, report))
+                    note += "\n".join(reports)
                     thread.reply(note, internal=True)
                 continue
             # banned check
@@ -681,6 +717,8 @@ def join_subreddit(subreddit):
             return False, "quarantined"
         elif subreddit.subreddit_type not in ["public", "restricted", "gold_only", "user"]:
             return False, subreddit.subreddit_type
+        elif subreddit in MULTIREDDITS.get("prohibited", set()):
+            return False, "prohibited"
     except prawcore.exceptions.Forbidden:
         return False, "quarantined"
     except prawcore.exceptions.NotFound:
@@ -692,6 +730,8 @@ def join_subreddit(subreddit):
     try:
         subreddit.mod.accept_invite()
         SUBREDDIT_LIST.add(subreddit)
+        if subreddit in MULTIREDDITS.get("restricted", set()):
+            HOME.message("Joined restricted subreddit", "/r/{}".format(subreddit))
     except Exception as e:
         if e.items[0].error_type == "NO_INVITE_FOUND" and subreddit.moderator(ME):
             return False, "moderator"
@@ -806,8 +846,9 @@ def check_unbans():
         if not UNBAN_STATE[account]:
             logging.info("finished unban for /u/{}".format(account))
             HOME.flair.delete(account)
-            schedule(check_unbans, schedule=86400, when="defer")
             del UNBAN_STATE[account]
+            if not UNBAN_STATE:
+                schedule(check_unbans, schedule=86400, when="defer")
     except Exception as e:
         logging.error("exception checking unbans: {}".format(e))
 
