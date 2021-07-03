@@ -780,7 +780,7 @@ def check_state():
         if not UNBAN_STATE:
             for flair in HOME.flair():
                 if flair.get("user") and "unban" in flair.get("flair_css_class"):
-                    subreddits = r.user.me().moderated()
+                    subreddits = list(r.user.me().moderated())
                     if not subreddits:
                         raise RuntimeError("empty subreddit list")
                     UNBAN_STATE[flair.get("user")] = subreddits
