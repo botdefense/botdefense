@@ -565,7 +565,7 @@ def check_mail():
             # handle non-subreddit messages
             if not message.subreddit:
                 message.mark_read()
-                if message.author in ["mod_mailer", "reddit"]:
+                if message.author in ["[deleted]", "mod_mailer", "reddit"]:
                     continue
                 if message.distinguished in ["admin", "gold-auto"]:
                     continue
