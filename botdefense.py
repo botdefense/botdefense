@@ -196,7 +196,12 @@ def friend_list(cached=False):
         return FRIEND_LIST
 
     logging.info("loading friends")
-    friends = set(r.user.friends())
+    try:
+        friends = set(r.get("/prefs/friends")[0])
+    except Exception as e:
+        logging.error("exception loading friends: {}".format(e))
+    if not friends:
+        friends = set(r.user.friends())
     if friends:
         FRIEND_LIST = friends
     else:
@@ -252,6 +257,8 @@ def check_comments():
             for comment in SCAN.comments(limit=100, params={"after": after}):
                 if str(comment.id) in COMMENT_CACHE:
                     continue
+                if comment.created_utc <= time.time() - 3600:
+                    break
                 link = "https://www.reddit.com/comments/{}/_/{}".format(comment.submission.id, comment.id)
                 consider_action(comment, link)
                 # we only cache identifiers after processing successfully
@@ -343,16 +350,14 @@ def consider_action(post, link):
         return False
 
     try:
-        for contributor in subreddit.contributor(account):
-            logging.info("/u/{} is whitelisted via approved users in /r/{}".format(account, subreddit))
-            WHITELIST_CACHE[activity] = time.time()
-            return False
-    except Exception as e:
-        logging.info("unable to check approved users for /u/{} in /r/{}: {}".format(account, subreddit, e))
-        # fail safe
         if not permissions or "access" in permissions or "all" in permissions:
-            logging.error("failing safe for /u/{} in /r/{}".format(account, subreddit))
-            return False
+            for contributor in subreddit.contributor(account):
+                logging.info("/u/{} is whitelisted via approved users in /r/{}".format(account, subreddit))
+                WHITELIST_CACHE[activity] = time.time()
+                return False
+    except Exception as e:
+        logging.error("error checking approved users, failing safe for /u/{} in /r/{}: {}".format(account, subreddit, e))
+        return False
 
     try:
         if subreddit.moderator(account):
@@ -367,12 +372,14 @@ def consider_action(post, link):
     if "access" in permissions or "all" in permissions:
         ban(account, subreddit, link, ("mail" in permissions))
 
+    if getattr(post, "removed", None) or getattr(post, "spam", None):
+        return True
+
     delay = int(time.time() - post.created_utc)
     if "posts" in permissions or "all" in permissions:
         try:
-            if not getattr(post, "removed", None) and not getattr(post, "spam", None):
-                logging.info("removing {} by /u/{} after {} seconds".format(link, account, delay))
-                post.mod.remove(spam=True)
+            logging.info("removing {} by /u/{} after {} seconds".format(link, account, delay))
+            post.mod.remove(spam=True)
         except Exception as e:
             logging.error("error removing {}: {}".format(link, e))
     elif permissions:
@@ -397,7 +404,7 @@ def is_friend(user):
     except Exception as e:
         logging.debug("exception checking friends for /u/{}: {}".format(user, e))
     try:
-        return user in r.user.friends()
+        return user in r.get("/prefs/friends")[0]
     except Exception as e:
         logging.error("failed searching friends for /u/{}: {}".format(user, e))
     return None
@@ -457,13 +464,8 @@ def find_canonical(name, fast=False):
         except Exception as e:
             logging.error("exception searching {} for canonical post: {}".format(query, e))
 
-    if fast:
-        limit = 100
-    else:
-        limit = 1000
-
     try:
-        for recent in HOME.new(limit=limit):
+        for recent in HOME.new(limit=100 if fast else 1000):
             if recent.title == title and recent.author == ME:
                 return recent
     except Exception as e:
@@ -718,6 +720,7 @@ def join_subreddit(subreddit):
         elif subreddit.subreddit_type not in ["public", "restricted", "gold_only", "user"]:
             return False, subreddit.subreddit_type
         elif subreddit in MULTIREDDITS.get("prohibited", set()):
+            HOME.message("Invitation from prohibited subreddit", "/r/{}".format(subreddit))
             return False, "prohibited"
     except prawcore.exceptions.Forbidden:
         return False, "quarantined"
