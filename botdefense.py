@@ -393,14 +393,15 @@ def consider_action(post, link):
 
 def is_friend(user):
     try:
-        if type(user) == str:
-            return r.redditor(user).is_friend
-        else:
+        if isinstance(user, praw.models.Redditor):
             return user.is_friend
     except Exception as e:
         logging.debug("exception checking is_friend for /u/{}: {}".format(user, e))
     try:
         return r.get("/api/v1/me/friends/" + str(user)) == str(user)
+    except praw.exceptions.RedditAPIException as e:
+        if e.items[0].error_type in ["NOT_FRIEND", "USER_DOESNT_EXIST"]:
+            return False
     except Exception as e:
         logging.debug("exception checking friends for /u/{}: {}".format(user, e))
     try:
