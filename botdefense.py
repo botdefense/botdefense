@@ -189,24 +189,22 @@ def update_status():
         logging.error("unable to update status: {}".format(e))
 
 
-def friend_list(cached=False):
+def load_friends():
     global FRIEND_LIST
 
-    if cached and FRIEND_LIST:
-        return FRIEND_LIST
-
     logging.info("loading friends")
+    friends = set()
     try:
-        friends = set(r.get("/prefs/friends")[0])
+        for flair in r.user.me().subreddit.flair():
+            if flair.get("user") and flair.get("flair_css_class") == "banned":
+                friends.add(flair.get("user"))
     except Exception as e:
         logging.error("exception loading friends: {}".format(e))
-    if not friends:
-        friends = set(r.user.friends())
+        raise
     if friends:
         FRIEND_LIST = friends
     else:
         raise RuntimeError("empty friends list")
-    return FRIEND_LIST
 
 
 def option(subreddit, name):
@@ -297,7 +295,7 @@ def check_queue():
         for submission in r.subreddit("mod").mod.modqueue(limit=100, only="submissions"):
             if str(submission.id) in QUEUE_IDS:
                 continue
-            if submission.author in friend_list(cached=True):
+            if submission.author in FRIEND_LIST:
                 link = "https://www.reddit.com/comments/{}".format(submission.id)
                 logging.info("queue hit for /u/{} in /r/{} at {}".format(submission.author,
                                                                          submission.subreddit, link))
@@ -399,16 +397,28 @@ def is_friend(user):
         logging.debug("exception checking is_friend for /u/{}: {}".format(user, e))
     try:
         return r.get("/api/v1/me/friends/" + str(user)) == str(user)
-    except praw.exceptions.RedditAPIException as e:
-        if e.items[0].error_type in ["NOT_FRIEND", "USER_DOESNT_EXIST"]:
+    except Exception as e:
+        if type(e) == praw.exceptions.RedditAPIException and e.items[0].error_type in ["NOT_FRIEND", "USER_DOESNT_EXIST"]:
             return False
-    except Exception as e:
-        logging.debug("exception checking friends for /u/{}: {}".format(user, e))
-    try:
-        return user in r.get("/prefs/friends")[0]
-    except Exception as e:
-        logging.error("failed searching friends for /u/{}: {}".format(user, e))
+        logging.warning("exception checking friends for /u/{}: {}".format(user, e))
     return None
+
+
+def add_friend(user):
+    global FRIEND_LIST
+
+    user.friend()
+    r.user.me().subreddit.flair.set(user, "banned", css_class="banned")
+    FRIEND_LIST.add(user)
+
+
+def remove_friend(user):
+    global FRIEND_LIST
+
+    user.unfriend()
+    r.user.me().subreddit.flair.delete(user)
+    if user in FRIEND_LIST:
+        FRIEND_LIST.remove(user)
 
 
 def ban(account, subreddit, link, mail):
@@ -481,7 +491,7 @@ def check_contributions():
         if submission.author == ME:
             continue
 
-        if submission.author in friend_list(cached=True):
+        if submission.author in FRIEND_LIST:
             logging.info("contribution from friend /u/{}".format(submission.author))
             link = "https://www.reddit.com/comments/{}".format(submission.id)
             if consider_action(submission, link):
@@ -555,7 +565,7 @@ def check_mail():
             message_data = ["message {}".format(message.fullname)]
             if message.author:
                 message_data.append("by /u/{}".format(message.author))
-                if message.author in friend_list(cached=True):
+                if message.author in FRIEND_LIST:
                     message_data.append("(friend)")
             if message.subreddit:
                 message_data.append("from /r/{}".format(message.subreddit))
@@ -572,7 +582,7 @@ def check_mail():
                     continue
                 if message.distinguished in ["admin", "gold-auto"]:
                     continue
-                if message.author in friend_list(cached=True) or message.author.moderated():
+                if message.author in FRIEND_LIST or message.author.moderated():
                     message.reply("I am a bot. If this is regarding {}, please message /r/{}. For anything else, please message the relevant subreddit.".format(ME, HOME))
                 continue
 
@@ -642,10 +652,10 @@ def check_modmail():
     thread = None
     try:
         for thread in r.subreddit("all").modmail.conversations(limit=100):
-            id = ":".join([str(thread.id), str(thread.last_mod_update), str(thread.last_user_update)])
-            if id in MODMAIL_IDS:
+            modmail_id = ":".join([str(thread.id), str(thread.last_mod_update), str(thread.last_user_update)])
+            if modmail_id in MODMAIL_IDS:
                 continue
-            MODMAIL_IDS.append(id)
+            MODMAIL_IDS.append(modmail_id)
             account = None
             banned = False
             # fastest checks
@@ -660,7 +670,7 @@ def check_modmail():
                     account = thread.user
             except:
                 continue
-            if not account or account not in friend_list(cached=True):
+            if not account or account not in FRIEND_LIST:
                 continue
             # handled check
             if ME in thread.authors:
@@ -752,28 +762,25 @@ def check_state():
 
     logging.info("checking state")
     try:
-        recent = {}
+        edited = {}
+        # get recent flair edits
         for log in HOME.mod.log(action="editflair", limit=100):
             # only log ids can be persistently cached, not submission ids
             if str(log.id) in LOG_IDS:
                 continue
             if log.target_author != ME or not log.target_fullname.startswith("t3_"):
                 continue
-            # cache recent submissions and update friend list
-            if not recent:
-                for submission in HOME.new(limit=100):
-                    recent[str(submission)] = submission
-                friend_list(cached=False)
-                schedule(friend_list, when="defer")
+            if edited.get(log.target_fullname):
+                edited[log.target_fullname].append(log.id)
+            else:
+                edited[log.target_fullname] = [log.id]
+        for submission in r.info(edited.keys()):
             try:
-                # sync the submission and update friend list if needed
-                entry = log.target_fullname[3:]
-                if sync_submission(recent.get(entry, r.submission(id=entry))):
-                    friend_list(cached=False)
-                    schedule(friend_list, when="defer")
-                # we only cache non-recent log identifiers after processing successfully
-                if log.created_utc < time.time() - 600:
-                    LOG_IDS.append(str(log.id))
+                # sync the submission
+                sync_submission(submission)
+                # we only cache log identifiers after processing successfully
+                for log_id in edited[submission.fullname]:
+                    LOG_IDS.append(log_id)
             except Exception as e:
                 logging.error("exception processing log {}: {}".format(log.id, e))
     except Exception as e:
@@ -783,7 +790,7 @@ def check_state():
     try:
         if not UNBAN_STATE:
             for flair in HOME.flair():
-                if flair.get("user") and "unban" in flair.get("flair_css_class"):
+                if flair.get("user") and flair.get("flair_css_class") == "unban":
                     subreddits = list(r.user.me().moderated())
                     if not subreddits:
                         raise RuntimeError("empty subreddit list")
@@ -812,9 +819,9 @@ def sync_submission(submission):
             account = m.group(1)
     if account and submission.link_flair_text != "pending":
         user = r.redditor(account)
-        if submission.link_flair_text == "banned" and user not in friend_list(cached=True):
+        if submission.link_flair_text == "banned" and user not in FRIEND_LIST:
             try:
-                user.friend()
+                add_friend(user)
                 logging.info("added friend /u/{}".format(user))
             except praw.exceptions.RedditAPIException as e:
                 if e.items[0].error_type == "USER_DOESNT_EXIST":
@@ -825,11 +832,11 @@ def sync_submission(submission):
             except Exception as e:
                 logging.error("error adding friend /u/{}: {}".format(user, e))
             return True
-        elif submission.link_flair_text != "banned" and user in friend_list(cached=True):
+        elif submission.link_flair_text != "banned" and user in FRIEND_LIST:
             try:
-                user.unfriend()
+                remove_friend(user)
                 logging.info("removed friend /u/{}".format(user))
-                if submission.link_flair_text not in ["inactive", "retired"]:
+                if submission.link_flair_text in ["declined", "organic", "service"]:
                     HOME.flair.set(user, css_class="unban")
             except Exception as e:
                 logging.error("error removing friend /u/{}: {}".format(user, e))
@@ -859,17 +866,17 @@ def check_unbans():
 
 if __name__ == "__main__":
     SCHEDULE = {
-        kill_switch: 120,
-        load_subreddits: 3600,
         check_comments: 5,
-        check_submissions: 30,
-        check_queue: 60,
+        check_contributions: 60,
         check_mail: 120,
         check_modmail: 30,
-        check_contributions: 60,
-        check_unbans: 86400,
+        check_queue: 60,
         check_state: 300,
-        friend_list: 3600,
+        check_submissions: 30,
+        check_unbans: 86400,
+        kill_switch: 120,
+        load_friends: 86400,
+        load_subreddits: 86400,
         update_status: 600,
     }
     NEXT = SCHEDULE.copy()
@@ -877,6 +884,7 @@ if __name__ == "__main__":
     try:
         logging.info("starting")
         schedule(kill_switch, when="next")
+        schedule(load_friends, when="next")
         schedule(load_subreddits, when="next")
         while True:
             run()
