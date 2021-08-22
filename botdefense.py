@@ -415,7 +415,13 @@ def add_friend(user):
 def remove_friend(user):
     global FRIEND_LIST
 
-    user.unfriend()
+    try:
+        user.unfriend()
+    except praw.exceptions.RedditAPIException as e:
+        if e.items[0].error_type != "NOT_FRIEND":
+            raise
+    except:
+        raise
     r.user.me().subreddit.flair.delete(user)
     if user in FRIEND_LIST:
         FRIEND_LIST.remove(user)
@@ -840,6 +846,7 @@ def sync_submission(submission):
                     HOME.flair.set(user, css_class="unban")
             except Exception as e:
                 logging.error("error removing friend /u/{}: {}".format(user, e))
+                HOME.message("Error removing friend", "/u/{}".format(user))
             return True
     return False
 
