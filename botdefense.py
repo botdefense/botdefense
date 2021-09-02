@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 import praw
 import prawcore.exceptions
+import requests
 import yaml
 
 
@@ -482,8 +483,26 @@ def find_canonical(name, fast=False):
             logging.error("exception searching {} for canonical post: {}".format(query, e))
 
     try:
+        query = requests.get("https://api.pushshift.io/reddit/submission/search", timeout=15,
+                             params={ "q": name, "author": ME, "subreddit": str(HOME) })
+        query.raise_for_status()
+        results = query.json()
+        if type(results) is dict and type(results.get("data")) is list:
+            for result in results["data"]:
+                if type(result) is dict and result.get("id") and result.get("url") == url:
+                    similar = r.submission(result["id"])
+                    if getattr(similar, "removed", None) or getattr(similar, "spam", None):
+                        continue
+                    if similar.title == title and similar.author == ME:
+                        logging.info("using Pushshift result for {}".format(name))
+                        return similar
+    except Exception as e:
+        logging.error("exception querying Pushshift for canonical post: {}".format(e))
+
+    try:
         for recent in HOME.new(limit=100 if fast else 1000):
             if recent.title == title and recent.author == ME:
+                logging.info("using recent result for {}".format(name))
                 return recent
     except Exception as e:
         logging.error("exception checking recent posts for canonical post: {}".format(e))
@@ -518,9 +537,7 @@ def check_contributions():
 
         try:
             user = r.redditor(name=account)
-            user_data = r.get(
-                "/api/user_data_by_account_ids", {"ids": user.fullname}
-            )
+            user_data = r.get("/api/user_data_by_account_ids", {"ids": user.fullname})
             name = user_data[user.fullname]["name"]
         except Exception as e:
             logging.debug("exception checking account {}: ".format(account, e))
@@ -532,6 +549,20 @@ def check_contributions():
                                        " please message /r/{} if you believe this was an error.".format(HOME))
             comment.mod.distinguish()
             logging.info("contribution {} from /u/{} rejected".format(submission.permalink, submission.author))
+            continue
+
+        if submission.author == user:
+            submission.mod.remove()
+            HOME.banned.add(submission.author, ban_message="Submitting your own account is not allowed.",
+                            note="submitted their own account {}".format(submission.permalink))
+            logging.info("contribution {} from /u/{} is submitter account".format(submission.permalink, submission.author))
+            continue
+
+        if HOME.moderator(user):
+            submission.mod.remove()
+            HOME.banned.add(submission.author, ban_message="Submitting a moderator account is not allowed.",
+                            note="submitted moderator account {}".format(submission.permalink))
+            logging.info("contribution {} from /u/{} is moderator account".format(submission.permalink, submission.author))
             continue
 
         canonical = find_canonical(name)
