@@ -71,6 +71,9 @@ NOTE_LONG = ("Private Moderator Note: /u/{0} is [listed on /r/{1}]({2}).\n\n"
              "to=/r/{1}&subject=Ban%20dispute%20for%20/u/{0}%20on%20/r/{3}).\n"
              "- If this account is a bot that you wish to allow, remember to [whitelist]"
              "(/r/{1}/wiki/index) it before you unban it.")
+APPEAL_MESSAGE = ("Your classification appeal has been received and will be reviewed by a "
+                  "moderator. If accepted, the result of your appeal will apply to any "
+                  "subreddit using /r/{}.\n\n*This is an automated message.*")
 REPORT_REASON = "bot or bot-like account (moderator permissions limited to reporting)"
 UNBAN_STATE = {}
 
@@ -473,6 +476,7 @@ def unban(account, subreddit):
 def find_canonical(name, fast=False):
     title = "overview for " + name
     url = "https://www.reddit.com/user/" + name
+    pushshift = False
 
     for query in "url:\"{}\"".format(url), "title:\"{}\"".format(name):
         try:
@@ -480,40 +484,86 @@ def find_canonical(name, fast=False):
                 if similar.title == title and similar.author == ME:
                     return similar
         except Exception as e:
+            pushshift = True
             logging.error("exception searching {} for canonical post: {}".format(query, e))
-
-    try:
-        query = requests.get("https://api.pushshift.io/reddit/submission/search", timeout=15,
-                             params={ "q": name, "author": ME, "subreddit": str(HOME) })
-        query.raise_for_status()
-        results = query.json()
-        if type(results) is dict and type(results.get("data")) is list:
-            for result in results["data"]:
-                if type(result) is dict and result.get("id") and result.get("url") == url:
-                    similar = r.submission(result["id"])
-                    if getattr(similar, "removed", None) or getattr(similar, "spam", None):
-                        continue
-                    if similar.title == title and similar.author == ME:
-                        logging.info("using Pushshift result for {}".format(name))
-                        return similar
-    except Exception as e:
-        logging.error("exception querying Pushshift for canonical post: {}".format(e))
 
     try:
         for recent in HOME.new(limit=100 if fast else 1000):
             if recent.title == title and recent.author == ME:
                 logging.info("using recent result for {}".format(name))
                 return recent
+            if recent.created_utc < time.time() - 86400:
+                break
     except Exception as e:
+        pushshift = True
         logging.error("exception checking recent posts for canonical post: {}".format(e))
+
+    try:
+        if pushshift:
+            query = requests.get("https://api.pushshift.io/reddit/submission/search", timeout=15,
+                                 params={ "q": name, "author": ME, "subreddit": str(HOME) })
+            query.raise_for_status()
+            results = query.json()
+            if type(results) is dict and type(results.get("data")) is list:
+                for result in results["data"]:
+                    if type(result) is dict and result.get("id") and result.get("url") == url:
+                        similar = r.submission(result["id"])
+                        if getattr(similar, "removed", None) or getattr(similar, "spam", None):
+                            continue
+                        if similar.title == title and similar.author == ME:
+                            logging.info("using Pushshift result for {}".format(name))
+                            return similar
+    except Exception as e:
+        logging.error("exception querying Pushshift for canonical post: {}".format(e))
 
     return None
 
 
+def process_contribution(submission, result, note=None, reply=None, crosspost=None):
+    try:
+        submission.mod.remove()
+    except Exception as e:
+        logging.warning("exception removing contribution {}: {}".format(submission.permalink, e))
+    try:
+        if reply:
+            comment = submission.reply(reply)
+            comment.mod.distinguish()
+    except Exception as e:
+        logging.warning("exception replying to contribution {}: {}".format(submission.permalink, e))
+    try:
+        if crosspost and crosspost.subreddit.subreddit_type != "private":
+            for subreddit in MULTIREDDITS.get("crossposts", set()):
+                available = False
+                for iterator in subreddit.search("url:\"{}\"".format(crosspost.url)), subreddit.new():
+                    if not available:
+                        for post in iterator:
+                            if not post.archived and post.title == crosspost.title:
+                                available = True
+                                break
+                if not available:
+                    crosspost.crosspost(subreddit, send_replies=False)
+    except Exception as e:
+        logging.warning("exception crossposting {}: {}".format(crosspost.permalink, e))
+    note = " " + note if note else ""
+    log = "contribution {} from /u/{} {}{}".format(submission.permalink, submission.author, result, note)
+    if result == "error":
+        logging.error(log)
+        HOME.message("Error processing contribution", "{}".format(submission.permalink))
+    else:
+        logging.info(log)
+
+
 def check_contributions():
     logging.info("checking for contributions")
-    for submission in HOME.new(limit=100):
+    for submission in r.multireddit(ME, name="contributions").new(limit=1000):
+        if submission.created_utc < time.time() - 3600:
+            break
+
         if submission.author == ME:
+            continue
+
+        # wait for flair from AutoModerator
+        if not submission.link_flair_text:
             continue
 
         if submission.author in FRIEND_LIST:
@@ -543,26 +593,44 @@ def check_contributions():
             logging.debug("exception checking account {}: ".format(account, e))
 
         if not name:
-            submission.mod.remove()
-            comment = submission.reply("Thank you for your submission! That account does not appear to exist"
-                                       " (perhaps it has already been suspended, banned, or deleted), but"
-                                       " please message /r/{} if you believe this was an error.".format(HOME))
-            comment.mod.distinguish()
-            logging.info("contribution {} from /u/{} rejected".format(submission.permalink, submission.author))
+            reply = ("Thank you for your submission! That account does not appear to exist"
+                     " (perhaps it has already been suspended, banned, or deleted), but"
+                     " please message /r/{} if you believe this was an error.".format(HOME))
+            process_contribution(submission, "rejected", reply=reply)
             continue
 
-        if submission.author == user:
-            submission.mod.remove()
+        if submission.author == user and not HOME.moderator(submission.author):
+            process_contribution(submission, "blocked", note="(submitter account)")
             HOME.banned.add(submission.author, ban_message="Submitting your own account is not allowed.",
                             note="submitted their own account {}".format(submission.permalink))
-            logging.info("contribution {} from /u/{} is submitter account".format(submission.permalink, submission.author))
             continue
 
-        if HOME.moderator(user):
-            submission.mod.remove()
+        if HOME.moderator(user) and not HOME.moderator(submission.author):
+            process_contribution(submission, "blocked", note="(moderator account)")
             HOME.banned.add(submission.author, ban_message="Submitting a moderator account is not allowed.",
                             note="submitted moderator account {}".format(submission.permalink))
-            logging.info("contribution {} from /u/{} is moderator account".format(submission.permalink, submission.author))
+            continue
+
+        approved = True
+        try:
+            for report_name in ["mod_reports", "mod_reports_dismissed"]:
+                value = getattr(submission, report_name, None)
+                if value:
+                    for report, moderator in value:
+                        if moderator == "AutoModerator":
+                            logging.info("contribution {} from /u/{} reported for \"{}\"".format(submission.permalink, submission.author, report))
+                            approved = False
+            if not approved:
+                minimum = option(HOME, "contribution_minimum_subscribers")
+                if minimum:
+                    moderated = submission.author.moderated()
+                    if moderated and moderated[0].subscribers >= minimum:
+                        approved = True
+        except Exception as e:
+            logging.warning("exception reviewing /u/{} for {}: {}".format(submission.author, submission.permalink, e))
+        if not approved:
+            reply = "Submissions must be made by approved users."
+            process_contribution(submission, "denied", reply=reply)
             continue
 
         canonical = find_canonical(name)
@@ -570,28 +638,30 @@ def check_contributions():
             if not canonical:
                 title = "overview for " + name
                 url = "https://www.reddit.com/user/" + name
-                post = HOME.submit(title, url=url)
-                post.report("Reviewable submission from /u/{}: please approve and update flair".format(submission.author))
-                post.disable_inbox_replies()
+                flair = None
+                try:
+                    for template in HOME.flair.link_templates:
+                        if template.get("css_class") == "pending":
+                            flair = template.get("id")
+                            break
+                except Exception as e:
+                    logging.warning("exception searching link templates: {}".format(e))
+                post = HOME.submit(title, url=url, send_replies=False, flair_id=flair)
+                post.report("Reviewable submission https://redd.it/{} from /u/{}".format(submission.id, submission.author))
         except Exception as e:
             logging.error("exception creating canonical post: {}".format(e))
 
-        submission.mod.remove()
         if post:
-            comment = submission.reply("Thank you for your submission! We have created a new"
-                                       " [entry for this account]({}).".format(post.permalink))
-            comment.mod.distinguish()
-            logging.info("contribution {} from /u/{} accepted for {}".format(submission.permalink, submission.author, name))
+            reply = ("Thank you for your submission! We have created a new"
+                     " [entry for this account]({}).".format(post.permalink))
+            process_contribution(submission, "accepted", note="for {}".format(name), reply=reply, crosspost=post)
         elif canonical:
-            comment = submission.reply("Thank you for your submission! It looks like we already have"
-                                       " an [entry for this account]({}).".format(canonical.permalink))
-            comment.mod.distinguish()
-            logging.info("contribution {} from /u/{} duplicate for {}".format(submission.permalink, submission.author, name))
+            reply = ("Thank you for your submission! It looks like we already have"
+                     " an [entry for this account]({}).".format(canonical.permalink))
+            process_contribution(submission, "duplicate", note="for {}".format(name), reply=reply, crosspost=canonical)
         else:
-            comment = submission.reply("Thank you for your submission!")
-            comment.mod.distinguish()
-            logging.error("contribution {} from /u/{} error".format(submission.permalink, submission.author))
-            HOME.message("Error processing contribution", "{}".format(submission.permalink))
+            reply = "Thank you for your submission!"
+            process_contribution(submission, "error", reply=reply)
 
 
 def check_mail():
@@ -735,6 +805,12 @@ def check_modmail():
                         elif not re.search("^(ignore|show|test)\\b.{0,16}$", report, re.I):
                             reports.append("- {}: {}".format(moderator, report))
                     note += "\n".join(reports)
+                    if canonical.link_flair_text == "banned":
+                        try:
+                            if thread.user.mute_status.get("muteCount") == 0:
+                                thread.reply(APPEAL_MESSAGE.format(HOME), author_hidden=True)
+                        except Exception as e:
+                            logging.warning("exception handling appeal {}: {}".format(thread, e))
                     thread.reply(note, internal=True)
                 continue
             # banned check
