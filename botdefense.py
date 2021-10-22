@@ -39,6 +39,7 @@ except Exception as e:
 # global data
 STATUS_POST = None
 FRIEND_LIST = set()
+INACTIVE_LIST = set()
 SUBREDDIT_LIST = set()
 MULTIREDDITS = {}
 COMMENT_AFTER = None
@@ -193,22 +194,31 @@ def update_status():
         logging.error("unable to update status: {}".format(e))
 
 
-def load_friends():
+def load_flair():
     global FRIEND_LIST
+    global INACTIVE_LIST
 
-    logging.info("loading friends")
+    logging.info("loading flair")
     friends = set()
+    inactive = set()
     try:
         for flair in r.user.me().subreddit.flair():
-            if flair.get("user") and flair.get("flair_css_class") == "banned":
-                friends.add(flair.get("user"))
+            if not flair.get("user"):
+                continue
+            if flair.get("flair_css_class") == "banned":
+                friends.add(flair["user"])
+            elif flair.get("flair_css_class") == "inactive":
+                inactive.add(flair["user"])
     except Exception as e:
-        logging.error("exception loading friends: {}".format(e))
+        logging.error("exception loading flair: {}".format(e))
         raise
     if friends:
         FRIEND_LIST = friends
+        INACTIVE_LIST = inactive
     else:
         raise RuntimeError("empty friends list")
+    logging.info("loaded {} friends".format(len(friends)))
+    logging.info("loaded {} inactive".format(len(inactive)))
 
 
 def option(subreddit, name):
@@ -414,6 +424,8 @@ def add_friend(user):
     user.friend()
     r.user.me().subreddit.flair.set(user, "banned", css_class="banned")
     FRIEND_LIST.add(user)
+    if user in INACTIVE_LIST:
+        INACTIVE_LIST.remove(user)
 
 
 def remove_friend(user):
@@ -429,6 +441,21 @@ def remove_friend(user):
     r.user.me().subreddit.flair.delete(user)
     if user in FRIEND_LIST:
         FRIEND_LIST.remove(user)
+
+
+def add_inactive(user):
+    global INACTIVE_LIST
+
+    r.user.me().subreddit.flair.set(user, "inactive", css_class="inactive")
+    INACTIVE_LIST.add(user)
+
+
+def remove_inactive(user):
+    global INACTIVE_LIST
+
+    r.user.me().subreddit.flair.delete(user)
+    if user in INACTIVE_LIST:
+        INACTIVE_LIST.remove(user)
 
 
 def ban(account, subreddit, link, mail):
@@ -531,7 +558,7 @@ def process_contribution(submission, result, note=None, reply=None, crosspost=No
     except Exception as e:
         logging.warning("exception replying to contribution {}: {}".format(submission.permalink, e))
     try:
-        if crosspost and crosspost.subreddit.subreddit_type != "private":
+        if crosspost:
             for subreddit in MULTIREDDITS.get("crossposts", set()):
                 available = False
                 for iterator in subreddit.search("url:\"{}\"".format(crosspost.url)), subreddit.new():
@@ -541,7 +568,11 @@ def process_contribution(submission, result, note=None, reply=None, crosspost=No
                                 available = True
                                 break
                 if not available:
-                    crosspost.crosspost(subreddit, send_replies=False)
+                    # submissions from private subreddits cannot be crossposted
+                    if crosspost.subreddit.subreddit_type == "private":
+                        subreddit.submit(crosspost.title, url="https://www.reddit.com" + crosspost.permalink, send_replies=False)
+                    else:
+                        crosspost.crosspost(subreddit, send_replies=False)
     except Exception as e:
         logging.warning("exception crossposting {}: {}".format(crosspost.permalink, e))
     note = " " + note if note else ""
@@ -556,14 +587,10 @@ def process_contribution(submission, result, note=None, reply=None, crosspost=No
 def check_contributions():
     logging.info("checking for contributions")
     for submission in r.multireddit(ME, name="contributions").new(limit=1000):
-        if submission.created_utc < time.time() - 3600:
+        if submission.created_utc < time.time() - 86400:
             break
 
         if submission.author == ME:
-            continue
-
-        # wait for flair from AutoModerator
-        if not submission.link_flair_text:
             continue
 
         if submission.author in FRIEND_LIST:
@@ -572,19 +599,21 @@ def check_contributions():
             if consider_action(submission, link):
                 continue
 
-        account = None
-        name = None
-        post = None
+        # wait for flair from AutoModerator except for moderators
+        if not submission.link_flair_text and not HOME.moderator(submission.author):
+            continue
 
+        account = None
         if submission.url:
             m = re.search("^https?://(?:\w+\.)?reddit\.com/u(?:ser)?/([\w-]{3,20})", submission.url)
             if m:
                 account = m.group(1)
 
-        # non-conforming posts are removed by AutoModerator so just skip them
+        # skip non-conforming submissions
         if not account:
             continue
 
+        name = None
         try:
             user = r.redditor(name=account)
             user_data = r.get("/api/user_data_by_account_ids", {"ids": user.fullname})
@@ -620,7 +649,7 @@ def check_contributions():
                         if moderator == "AutoModerator":
                             logging.info("contribution {} from /u/{} reported for \"{}\"".format(submission.permalink, submission.author, report))
                             approved = False
-            if not approved:
+            if not approved and submission.author.is_mod:
                 minimum = option(HOME, "contribution_minimum_subscribers")
                 if minimum:
                     moderated = submission.author.moderated()
@@ -634,6 +663,7 @@ def check_contributions():
             continue
 
         canonical = find_canonical(name)
+        post = None
         try:
             if not canonical:
                 title = "overview for " + name
@@ -889,6 +919,9 @@ def check_state():
                 edited[log.target_fullname] = [log.id]
         for submission in r.info(edited.keys()):
             try:
+                # skip removed and deleted submissions
+                if getattr(submission, "removed_by_category", None):
+                    continue
                 # sync the submission
                 sync_submission(submission)
                 # we only cache log identifiers after processing successfully
@@ -930,32 +963,63 @@ def sync_submission(submission):
         m = re.search("/u(?:ser)?/([\w-]+)", submission.url)
         if m:
             account = m.group(1)
-    if account and submission.link_flair_text != "pending":
+    if account:
         user = r.redditor(account)
-        if submission.link_flair_text == "banned" and user not in FRIEND_LIST:
+        # pending
+        if submission.link_flair_text == "pending":
+            return
+        # banned
+        elif submission.link_flair_text == "banned":
+            if user in FRIEND_LIST:
+                return
             try:
                 add_friend(user)
                 logging.info("added friend /u/{}".format(user))
             except praw.exceptions.RedditAPIException as e:
                 if e.items[0].error_type == "USER_DOESNT_EXIST":
                     logging.debug("unable to add friend /u/{}: {}".format(user, e))
-                    return False
+                    return
                 else:
                     logging.error("error adding friend /u/{}: {}".format(user, e))
             except Exception as e:
                 logging.error("error adding friend /u/{}: {}".format(user, e))
-            return True
-        elif submission.link_flair_text != "banned" and user in FRIEND_LIST:
+            return
+        # inactive
+        elif submission.link_flair_text == "inactive":
+            if user in INACTIVE_LIST:
+                return
             try:
-                remove_friend(user)
-                logging.info("removed friend /u/{}".format(user))
-                if submission.link_flair_text in ["declined", "organic", "service"]:
-                    HOME.flair.set(user, css_class="unban")
+                if user in FRIEND_LIST:
+                    remove_friend(user)
+                    logging.info("removed friend /u/{}".format(user))
+                add_inactive(user)
+                logging.info("added inactive /u/{}".format(user))
+            except Exception as e:
+                logging.error("error adding inactive /u/{}: {}".format(user, e))
+                HOME.message("Error adding inactive", "/u/{}".format(user))
+            return
+        # neither banned nor inactive
+        elif user in FRIEND_LIST or user in INACTIVE_LIST:
+            try:
+                if user in FRIEND_LIST:
+                    remove_friend(user)
+                    logging.info("removed friend /u/{}".format(user))
             except Exception as e:
                 logging.error("error removing friend /u/{}: {}".format(user, e))
                 HOME.message("Error removing friend", "/u/{}".format(user))
-            return True
-    return False
+            try:
+                if user in INACTIVE_LIST:
+                    remove_inactive(user)
+                    logging.info("removed inactive /u/{}".format(user))
+            except Exception as e:
+                logging.error("error removing inactive /u/{}: {}".format(user, e))
+                HOME.message("Error removing inactive", "/u/{}".format(user))
+            try:
+                if submission.link_flair_text in ["declined", "organic", "service"]:
+                    HOME.flair.set(user, css_class="unban")
+            except Exception as e:
+                logging.error("error adding unban /u/{}: {}".format(user, e))
+                HOME.message("Error adding unban", "/u/{}".format(user))
 
 
 def check_unbans():
@@ -989,7 +1053,7 @@ if __name__ == "__main__":
         check_submissions: 30,
         check_unbans: 86400,
         kill_switch: 120,
-        load_friends: 86400,
+        load_flair: 86400,
         load_subreddits: 86400,
         update_status: 600,
     }
@@ -998,7 +1062,7 @@ if __name__ == "__main__":
     try:
         logging.info("starting")
         schedule(kill_switch, when="next")
-        schedule(load_friends, when="next")
+        schedule(load_flair, when="next")
         schedule(load_subreddits, when="next")
         while True:
             run()
