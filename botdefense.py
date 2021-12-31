@@ -6,34 +6,11 @@ import logging
 import re
 import time
 from datetime import datetime
+import random
 import praw
 import prawcore.exceptions
 import requests
 import yaml
-
-
-# setup
-os.environ['TZ'] = 'UTC'
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | %(funcName)s | %(message)s',
-    datefmt='%Y-%m-%dT%H:%M:%S',
-)
-try:
-    assert praw.__version__.startswith('7.3.')
-    configuration = sys.argv[1]
-    r = praw.Reddit(configuration)
-    r.validate_on_submit = True
-    ME = str(r.user.me())
-    HOME = r.subreddit(ME)
-    SCAN = r.subreddit(r.config.custom.get("scan", "all"))
-except IndexError:
-    logging.error("usage: {} <praw.ini section>".format(sys.argv[0]))
-    sys.exit(1)
-except Exception as e:
-    logging.error("failed to obtain PRAW instance: {}".format(e))
-    time.sleep(60)
-    sys.exit(1)
 
 
 # global data
@@ -44,10 +21,11 @@ SUBREDDIT_LIST = set()
 MULTIREDDITS = {}
 COMMENT_AFTER = None
 COMMENT_CACHE = {}
+LOG_CACHE = {}
 WHITELIST_CACHE = {}
 SUBMISSION_IDS = []
-QUEUE_IDS = []
-LOG_IDS = []
+QUEUE_LIST = []
+QUEUE_COUNTER = 0
 MODMAIL_IDS = []
 OPTIONS_DEFAULT = { "modmail_mute": True, "modmail_notes": False }
 OPTIONS_DISABLED = { "modmail_mute": False, "modmail_notes": False }
@@ -77,6 +55,46 @@ APPEAL_MESSAGE = ("Your classification appeal has been received and will be revi
                   "subreddit using /r/{}.\n\n*This is an automated message.*")
 REPORT_REASON = "bot or bot-like account (moderator permissions limited to reporting)"
 UNBAN_STATE = {}
+
+
+# setup logging
+class LengthFilter(logging.Filter):
+    retry = None
+
+    def filter(self, record):
+        if record.funcName == '_do_retry' and record.msg.endswith('/about/modqueue/'):
+            m = re.search(r'/r/([\w-]+\+)+[\w-]+/', record.msg)
+            if m:
+                record.msg = record.msg.replace(m.group(0), f'/r/[{m.group(0).count("+") + 1} subreddits]/')
+                if self.retry and self.retry[0] == hash(m.group(0)) and 60 < time.time() - self.retry[1] < 300:
+                    split_subreddits()
+                    record.msg += " (splitting subreddits)"
+                self.retry = (hash(m.group(0)), time.time())
+        return True
+
+
+os.environ['TZ'] = 'UTC'
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(funcName)s | %(message)s',
+                    datefmt='%Y-%m-%dT%H:%M:%S')
+logging.getLogger('prawcore').addFilter(LengthFilter())
+
+
+# setup reddit
+try:
+    assert praw.__version__.startswith('7.3.')
+    configuration = sys.argv[1]
+    r = praw.Reddit(configuration)
+    r.validate_on_submit = True
+    ME = str(r.user.me())
+    HOME = r.subreddit(ME)
+    SCAN = r.subreddit(r.config.custom.get("scan", "all"))
+except IndexError:
+    logging.error("usage: {} <praw.ini section>".format(sys.argv[0]))
+    sys.exit(1)
+except Exception as e:
+    logging.error("failed to obtain PRAW instance: {}".format(e))
+    time.sleep(60)
+    sys.exit(1)
 
 
 def schedule(function, schedule=None, when=None):
@@ -242,6 +260,32 @@ def load_configuration(subreddit):
     return configuration
 
 
+def split_subreddits():
+    global QUEUE_LIST
+
+    results = []
+    try:
+        subreddits = list(filter(lambda s: ':' not in str(s) and s.subreddit_type != "private", SUBREDDIT_LIST))
+        if not subreddits:
+            return
+        random.shuffle(subreddits)
+        subreddits = map(str, subreddits)
+        current = next(subreddits)
+        for subreddit in subreddits:
+            # queue requests are limited to 500 subreddits
+            # bad request errors start at 6393 bytes for queue requests with limit=100, only="submissions"
+            if current.count('+') + 1 == 500 or len(current) + len(subreddit) > 6380:
+                results.append(current)
+                current = subreddit
+            else:
+                current += '+' + subreddit
+        results.append(current)
+    except Exception as e:
+        logging.error("error slicing subreddits: {}".format(e))
+        return
+    QUEUE_LIST = results
+
+
 def load_subreddits():
     global SUBREDDIT_LIST
     global MULTIREDDITS
@@ -250,6 +294,7 @@ def load_subreddits():
     subreddits = set(r.user.me().moderated())
     if subreddits:
         SUBREDDIT_LIST = subreddits
+        split_subreddits()
     else:
         raise RuntimeError("empty subreddit list")
     MULTIREDDITS = {}
@@ -302,26 +347,23 @@ def check_submissions():
 
 
 def check_queue():
-    global QUEUE_IDS
+    global QUEUE_LIST
+    global QUEUE_COUNTER
 
     logging.info("checking queue")
     try:
-        for submission in r.subreddit("mod").mod.modqueue(limit=100, only="submissions"):
-            if str(submission.id) in QUEUE_IDS:
-                continue
+        if not QUEUE_LIST:
+            return
+        subreddits = QUEUE_LIST[QUEUE_COUNTER % len(QUEUE_LIST)]
+        for submission in r.subreddit(subreddits).mod.modqueue(limit=100, only="submissions"):
             if submission.author in FRIEND_LIST:
                 link = "https://www.reddit.com/comments/{}".format(submission.id)
                 logging.info("queue hit for /u/{} in /r/{} at {}".format(submission.author,
                                                                          submission.subreddit, link))
                 consider_action(submission, link)
-            # we only cache identifiers after processing successfully
-            QUEUE_IDS.append(str(submission.id))
     except Exception as e:
         logging.error("exception checking queue: {}".format(e))
-
-    # trim cache
-    if len(QUEUE_IDS) > 200:
-        QUEUE_IDS = QUEUE_IDS[-200:]
+    QUEUE_COUNTER += 1
 
 
 def consider_action(post, link):
@@ -570,13 +612,13 @@ def process_contribution(submission, result, note=None, reply=None, crosspost=No
                 if not available:
                     # submissions from private subreddits cannot be crossposted
                     if crosspost.subreddit.subreddit_type == "private":
-                        subreddit.submit(crosspost.title, url="https://www.reddit.com" + crosspost.permalink, send_replies=False)
+                        subreddit.submit(crosspost.title, url=submission.url, send_replies=False)
                     else:
                         crosspost.crosspost(subreddit, send_replies=False)
     except Exception as e:
         logging.warning("exception crossposting {}: {}".format(crosspost.permalink, e))
     note = " " + note if note else ""
-    log = "contribution {} from /u/{} {}{}".format(submission.permalink, submission.author, result, note)
+    log = "contribution {} from /u/{} with flair {} {}{}".format(submission.permalink, submission.author, submission.link_flair_text, result, note)
     if result == "error":
         logging.error(log)
         HOME.message("Error processing contribution", "{}".format(submission.permalink))
@@ -599,8 +641,8 @@ def check_contributions():
             if consider_action(submission, link):
                 continue
 
-        # wait for flair from AutoModerator except for moderators
-        if not submission.link_flair_text and not HOME.moderator(submission.author):
+        # wait for flair unless exempted
+        if not (submission.link_flair_text or submission.subreddit.subreddit_type == "private" or HOME.moderator(submission.author)):
             continue
 
         account = None
@@ -665,19 +707,29 @@ def check_contributions():
         canonical = find_canonical(name)
         post = None
         try:
+            css_class = "pending"
+            report_type = "Reviewable"
+            if submission.link_flair_text:
+                m = re.search("^contribution-(\w+)$", submission.link_flair_text)
+                if m:
+                    css_class = m.group(1)
+                    report_type = css_class.capitalize()
             if not canonical:
                 title = "overview for " + name
                 url = "https://www.reddit.com/user/" + name
                 flair = None
                 try:
                     for template in HOME.flair.link_templates:
-                        if template.get("css_class") == "pending":
+                        if template.get("css_class") == css_class:
                             flair = template.get("id")
                             break
                 except Exception as e:
                     logging.warning("exception searching link templates: {}".format(e))
                 post = HOME.submit(title, url=url, send_replies=False, flair_id=flair)
-                post.report("Reviewable submission https://redd.it/{} from /u/{}".format(submission.id, submission.author))
+                post.report("{} submission https://redd.it/{} from /u/{}".format(report_type, submission.id, submission.author))
+                if css_class != "pending":
+                    sync_submission(post)
+                    post.mod.approve()
         except Exception as e:
             logging.error("exception creating canonical post: {}".format(e))
 
@@ -899,24 +951,27 @@ def join_subreddit(subreddit):
 
 
 def check_state():
-    global LOG_IDS
     global COMMENT_CACHE
+    global LOG_CACHE
     global WHITELIST_CACHE
 
     logging.info("checking state")
     try:
         edited = {}
-        # get recent flair edits
-        for log in HOME.mod.log(action="editflair", limit=100):
-            # only log ids can be persistently cached, not submission ids
-            if str(log.id) in LOG_IDS:
-                continue
-            if log.target_author != ME or not log.target_fullname.startswith("t3_"):
-                continue
-            if edited.get(log.target_fullname):
-                edited[log.target_fullname].append(log.id)
-            else:
-                edited[log.target_fullname] = [log.id]
+        # get recent actions that may indicate a state change
+        for action in ["approvelink", "editflair"]:
+            for log in HOME.mod.log(action=action, limit=500):
+                # only log ids can be persistently cached, not submission ids
+                if str(log.id) in LOG_CACHE:
+                    continue
+                if log.created_utc <= time.time() - 86400:
+                    break
+                if log.target_author != ME or not log.target_fullname.startswith("t3_"):
+                    continue
+                if edited.get(log.target_fullname):
+                    edited[log.target_fullname].append(str(log.id))
+                else:
+                    edited[log.target_fullname] = [str(log.id)]
         for submission in r.info(edited.keys()):
             try:
                 # skip removed and deleted submissions
@@ -926,7 +981,7 @@ def check_state():
                 sync_submission(submission)
                 # we only cache log identifiers after processing successfully
                 for log_id in edited[submission.fullname]:
-                    LOG_IDS.append(log_id)
+                    LOG_CACHE[log_id] = time.time()
             except Exception as e:
                 logging.error("exception processing log {}: {}".format(log.id, e))
     except Exception as e:
@@ -950,11 +1005,8 @@ def check_state():
 
     # trim time-based caches
     expire_cache(COMMENT_CACHE, 3600)
+    expire_cache(LOG_CACHE, 86400)
     expire_cache(WHITELIST_CACHE, 3600)
-
-    # trim cache
-    if len(LOG_IDS) > 200:
-        LOG_IDS = LOG_IDS[-200:]
 
 
 def sync_submission(submission):
@@ -1048,7 +1100,7 @@ if __name__ == "__main__":
         check_contributions: 60,
         check_mail: 120,
         check_modmail: 30,
-        check_queue: 60,
+        check_queue: 20,
         check_state: 300,
         check_submissions: 30,
         check_unbans: 86400,
