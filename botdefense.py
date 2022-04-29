@@ -273,8 +273,8 @@ def split_subreddits():
         current = next(subreddits)
         for subreddit in subreddits:
             # queue requests are limited to 500 subreddits
-            # bad request errors start at 6393 bytes for queue requests with limit=100, only="submissions"
-            if current.count('+') + 1 == 500 or len(current) + len(subreddit) > 6380:
+            # bad request errors start around 6358 bytes for queue requests with limit=100, only="submissions"
+            if current.count('+') + 1 == 500 or len(current) + len(subreddit) > 6272:
                 results.append(current)
                 current = subreddit
             else:
@@ -362,7 +362,10 @@ def check_queue():
                                                                          submission.subreddit, link))
                 consider_action(submission, link)
     except Exception as e:
-        logging.error("exception checking queue: {}".format(e))
+        error = str(e)
+        if error.startswith("<html>"):
+            error = error.replace("\n", "")
+        logging.error("exception checking queue: {}".format(error))
     QUEUE_COUNTER += 1
 
 
@@ -404,7 +407,7 @@ def consider_action(post, link):
         return False
 
     try:
-        if not permissions or "access" in permissions or "all" in permissions:
+        if (not permissions or "access" in permissions or "all" in permissions) and subreddit.subreddit_type != "user":
             for contributor in subreddit.contributor(account):
                 logging.info("/u/{} is whitelisted via approved users in /r/{}".format(account, subreddit))
                 WHITELIST_CACHE[activity] = time.time()
@@ -545,15 +548,13 @@ def unban(account, subreddit):
 def find_canonical(name, fast=False):
     title = "overview for " + name
     url = "https://www.reddit.com/user/" + name
-    pushshift = False
 
     for query in "url:\"{}\"".format(url), "title:\"{}\"".format(name):
         try:
-            for similar in HOME.search(query):
+            for similar in HOME.search(query, limit=250):
                 if similar.title == title and similar.author == ME:
                     return similar
         except Exception as e:
-            pushshift = True
             logging.error("exception searching {} for canonical post: {}".format(query, e))
 
     try:
@@ -564,24 +565,22 @@ def find_canonical(name, fast=False):
             if recent.created_utc < time.time() - 86400:
                 break
     except Exception as e:
-        pushshift = True
         logging.error("exception checking recent posts for canonical post: {}".format(e))
 
     try:
-        if pushshift:
-            query = requests.get("https://api.pushshift.io/reddit/submission/search", timeout=15,
-                                 params={ "q": name, "author": ME, "subreddit": str(HOME) })
-            query.raise_for_status()
-            results = query.json()
-            if type(results) is dict and type(results.get("data")) is list:
-                for result in results["data"]:
-                    if type(result) is dict and result.get("id") and result.get("url") == url:
-                        similar = r.submission(result["id"])
-                        if getattr(similar, "removed", None) or getattr(similar, "spam", None):
-                            continue
-                        if similar.title == title and similar.author == ME:
-                            logging.info("using Pushshift result for {}".format(name))
-                            return similar
+        query = { "q": f'"{name}"', "author": ME, "subreddit": f'{HOME}', "limit": 100 }
+        response = requests.get("https://api.pushshift.io/reddit/submission/search", timeout=15, params=query)
+        response.raise_for_status()
+        results = response.json()
+        if type(results) is dict and type(results.get("data")) is list:
+            for result in results["data"]:
+                if type(result) is dict and result.get("id") and result.get("url") == url:
+                    similar = r.submission(result["id"])
+                    if getattr(similar, "removed", None) or getattr(similar, "spam", None):
+                        continue
+                    if similar.title == title and similar.author == ME:
+                        logging.info("using Pushshift result for {}".format(name))
+                        return similar
     except Exception as e:
         logging.error("exception querying Pushshift for canonical post: {}".format(e))
 
@@ -606,7 +605,7 @@ def process_contribution(submission, result, note=None, reply=None, crosspost=No
                 for iterator in subreddit.search("url:\"{}\"".format(crosspost.url)), subreddit.new():
                     if not available:
                         for post in iterator:
-                            if not post.archived and post.title == crosspost.title:
+                            if not post.archived and post.title == crosspost.title and post.author == ME:
                                 available = True
                                 break
                 if not available:
@@ -628,8 +627,10 @@ def process_contribution(submission, result, note=None, reply=None, crosspost=No
 
 def check_contributions():
     logging.info("checking for contributions")
+
+    pause = time.time() + 60
     for submission in r.multireddit(ME, name="contributions").new(limit=1000):
-        if submission.created_utc < time.time() - 86400:
+        if submission.created_utc < time.time() - 86400 or time.time() >= pause:
             break
 
         if submission.author == ME:
@@ -726,10 +727,15 @@ def check_contributions():
                 except Exception as e:
                     logging.warning("exception searching link templates: {}".format(e))
                 post = HOME.submit(title, url=url, send_replies=False, flair_id=flair)
-                post.report("{} submission https://redd.it/{} from /u/{}".format(report_type, submission.id, submission.author))
-                if css_class != "pending":
-                    sync_submission(post)
-                    post.mod.approve()
+                for attempt in range(3):
+                    try:
+                        post.report("{} submission https://redd.it/{} from /u/{}".format(report_type, submission.id, submission.author))
+                        if css_class != "pending" and flair:
+                            sync_submission(post)
+                            post.mod.approve()
+                        break
+                    except Exception as e:
+                        logging.error("exception reporting canonical post: {}".format(e))
         except Exception as e:
             logging.error("exception creating canonical post: {}".format(e))
 
@@ -744,6 +750,66 @@ def check_contributions():
         else:
             reply = "Thank you for your submission!"
             process_contribution(submission, "error", reply=reply)
+
+
+def check_notes():
+    logging.info("checking for notes")
+    if not MULTIREDDITS.get("notes"):
+        return
+    for comment in r.multireddit(ME, name="contributions").comments(limit=1000):
+        if comment.created_utc < time.time() - 86400:
+            break
+
+        if comment.author == ME:
+            continue
+
+        # only locked comments are used as notes
+        if not comment.locked:
+            continue
+
+        account = None
+        if comment.submission.url:
+            m = re.search("^https?://(?:\w+\.)?reddit\.com/u(?:ser)?/([\w-]{3,20})", comment.submission.url)
+            if m:
+                account = m.group(1)
+        if not account:
+            comment.mod.unlock()
+            continue
+
+        canonical = None
+        if comment.subreddit == HOME and comment.submission.author == ME:
+            canonical = comment.submission
+        else:
+            canonical = find_canonical(account)
+        if not canonical:
+            if comment.created_utc < time.time() - 43200:
+                logging.warning("unable to create note for {}".format(comment.permalink))
+                comment.mod.unlock()
+            continue
+
+        try:
+            for post in set(canonical.duplicates()):
+                if post.author != ME:
+                    continue
+                if post.subreddit not in MULTIREDDITS.get("notes", set()):
+                    continue
+                if post == comment.submission:
+                    continue
+                attribution = "Note from /u/{} at {}".format(comment.author, comment.permalink)
+                logging.info("creating note for {} on {}".format(comment.permalink, post.permalink))
+                try:
+                    post.reply("{}:\n\n---\n\n{}".format(attribution, comment.body))
+                except praw.exceptions.RedditAPIException as e:
+                    logging.warning("exception creating note for {}, trying again with short note: {}".format(comment.permalink, e))
+                    try:
+                        post.reply("{}.".format(attribution))
+                    except Exception as e:
+                        logging.error("exception creating note for {}: {}".format(comment.permalink, e))
+                except Exception as e:
+                    logging.error("exception creating note for {}: {}".format(comment.permalink, e))
+            comment.mod.unlock()
+        except Exception as e:
+            logging.error("exception checking for notes: {}".format(e))
 
 
 def check_mail():
@@ -767,9 +833,9 @@ def check_mail():
             # handle non-subreddit messages
             if not message.subreddit:
                 message.mark_read()
-                if message.author in ["[deleted]", "mod_mailer", "reddit"]:
-                    continue
                 if message.distinguished in ["admin", "gold-auto"]:
+                    continue
+                if message.author in ["[deleted]", "mod_mailer"]:
                     continue
                 if message.author in FRIEND_LIST or message.author.moderated():
                     message.reply("I am a bot. If this is regarding {}, please message /r/{}. For anything else, please message the relevant subreddit.".format(ME, HOME))
@@ -812,7 +878,7 @@ def check_mail():
                         logging.info("failure accepting invite {} from /r/{}".format(message.fullname, subreddit))
                     elif reason == "moderator":
                         logging.info("already moderator on /r/{}".format(subreddit))
-                    elif reason in ["banned", "prohibited"]:
+                    elif reason in ["banned", "prohibited", "quarantined"]:
                         logging.warning("ignoring invite from {} subreddit /r/{}".format(reason, subreddit))
                     else:
                         logging.info("declining invite from {} subreddit /r/{}".format(reason, subreddit))
@@ -875,7 +941,7 @@ def check_modmail():
                         mod_reports = canonical.mod_reports_dismissed + canonical.mod_reports
                     except AttributeError:
                         mod_reports = canonical.mod_reports
-                    reports = []
+                    notes = []
                     for report, moderator in mod_reports:
                         if moderator == ME:
                             contributor = ""
@@ -883,10 +949,28 @@ def check_modmail():
                             if m:
                                 contributor = "from {} ".format(m.group(1))
                             created = absolute_time(canonical.created_utc)
-                            reports.insert(0, "- Submission {}posted {}".format(contributor, created))
+                            notes.insert(0, "- Submission {}posted {}".format(contributor, created))
                         elif not re.search("^(ignore|show|test)\\b.{0,16}$", report, re.I):
-                            reports.append("- {}: {}".format(moderator, report))
-                    note += "\n".join(reports)
+                            notes.append("- {}: {}".format(moderator, report))
+                    for post in set(canonical.duplicates()):
+                        if post.author != ME:
+                            continue
+                        if post.subreddit not in MULTIREDDITS.get("notes", set()):
+                            continue
+                        authors = set()
+                        for comment in post.comments.list():
+                            if isinstance(comment, praw.models.MoreComments) or comment.body == "[deleted]":
+                                continue
+                            author = comment.author
+                            if author == ME:
+                                m = re.search("\\bfrom /u/([\w-]{3,20})", comment.body)
+                                if m:
+                                    author = m.group(1)
+                            if author:
+                                authors.add(str(author))
+                        if authors:
+                            notes.append("- [Notes from {}]({})".format(", ".join(sorted(authors)), post.permalink))
+                    note += "\n".join(notes)
                     if canonical.link_flair_text == "banned":
                         try:
                             if thread.user.mute_status.get("muteCount") == 0:
@@ -1100,6 +1184,7 @@ if __name__ == "__main__":
         check_contributions: 60,
         check_mail: 120,
         check_modmail: 30,
+        check_notes: 120,
         check_queue: 20,
         check_state: 300,
         check_submissions: 30,
@@ -1107,7 +1192,7 @@ if __name__ == "__main__":
         kill_switch: 120,
         load_flair: 86400,
         load_subreddits: 86400,
-        update_status: 600,
+        update_status: 900,
     }
     NEXT = SCHEDULE.copy()
 
