@@ -700,24 +700,18 @@ def check_contributions():
                         approved = True
         except Exception as e:
             logging.warning("exception reviewing /u/{} for {}: {}".format(submission.author, submission.permalink, e))
-        if not approved:
-            reply = "Submissions must be made by approved users."
-            process_contribution(submission, "denied", reply=reply)
-            continue
 
         canonical = find_canonical(name)
         post = None
         try:
-            css_class = "pending"
-            report_type = "Reviewable"
-            if submission.link_flair_text:
-                m = re.search("^contribution-(\w+)$", submission.link_flair_text)
-                if m:
-                    css_class = m.group(1)
-                    report_type = css_class.capitalize()
-            if not canonical:
-                title = "overview for " + name
-                url = "https://www.reddit.com/user/" + name
+            if approved and not canonical:
+                css_class = "pending"
+                report_type = "Reviewable"
+                if submission.link_flair_text:
+                    m = re.search("^contribution-(\w+)$", submission.link_flair_text)
+                    if m:
+                        css_class = m.group(1)
+                        report_type = css_class.capitalize()
                 flair = None
                 try:
                     for template in HOME.flair.link_templates:
@@ -726,6 +720,8 @@ def check_contributions():
                             break
                 except Exception as e:
                     logging.warning("exception searching link templates: {}".format(e))
+                title = "overview for " + name
+                url = "https://www.reddit.com/user/" + name
                 post = HOME.submit(title, url=url, send_replies=False, flair_id=flair)
                 for attempt in range(3):
                     try:
@@ -747,6 +743,10 @@ def check_contributions():
             reply = ("Thank you for your submission! It looks like we already have"
                      " an [entry for this account]({}).".format(canonical.permalink))
             process_contribution(submission, "duplicate", note="for {}".format(name), reply=reply, crosspost=canonical)
+        elif not approved:
+            reply = "Submissions must be made by approved users."
+            process_contribution(submission, "denied", reply=reply)
+            continue
         else:
             reply = "Thank you for your submission!"
             process_contribution(submission, "error", reply=reply)
