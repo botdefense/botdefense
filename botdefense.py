@@ -22,6 +22,9 @@ MULTIREDDITS = {}
 COMMENT_AFTER = None
 COMMENT_CACHE = {}
 LOG_CACHE = {}
+CONTRIBUTION_LIMIT = 0
+NOTE_FAILURE_CACHE = {}
+NOTE_LIMIT = 0
 WHITELIST_CACHE = {}
 SUBMISSION_IDS = []
 QUEUE_LIST = []
@@ -81,7 +84,7 @@ logging.getLogger('prawcore').addFilter(LengthFilter())
 
 # setup reddit
 try:
-    assert praw.__version__.startswith('7.3.')
+    assert praw.__version__.startswith('7.6.')
     configuration = sys.argv[1]
     r = praw.Reddit(configuration)
     r.validate_on_submit = True
@@ -203,7 +206,7 @@ def update_status():
             active_bans = "|Active bans|{}|\n".format(len(FRIEND_LIST))
         if recent_logs:
             recent_logs = "|Time|Subreddit|Action|\n|-|-|-|\n" + recent_logs
-        STATUS_POST.edit("|Attribute|Value|\n|-|-|\n{}"
+        STATUS_POST.edit(body="|Attribute|Value|\n|-|-|\n{}"
                          "|Current time|{}|\n"
                          "|Last action|{}|\n"
                          "\n&nbsp;\n&nbsp;\n\n{}"
@@ -455,8 +458,9 @@ def is_friend(user):
     except Exception as e:
         logging.debug("exception checking is_friend for /u/{}: {}".format(user, e))
     try:
-        return r.get("/api/v1/me/friends/" + str(user)) == str(user)
+        return r.get(path=f"/api/v1/me/friends/{user}") == str(user)
     except Exception as e:
+        print(vars(e))
         if type(e) == praw.exceptions.RedditAPIException and e.items[0].error_type in ["NOT_FRIEND", "USER_DOESNT_EXIST"]:
             return False
         logging.warning("exception checking friends for /u/{}: {}".format(user, e))
@@ -467,7 +471,7 @@ def add_friend(user):
     global FRIEND_LIST
 
     user.friend()
-    r.user.me().subreddit.flair.set(user, "banned", css_class="banned")
+    r.user.me().subreddit.flair.set(user, text="banned", css_class="banned")
     FRIEND_LIST.add(user)
     if user in INACTIVE_LIST:
         INACTIVE_LIST.remove(user)
@@ -491,7 +495,7 @@ def remove_friend(user):
 def add_inactive(user):
     global INACTIVE_LIST
 
-    r.user.me().subreddit.flair.set(user, "inactive", css_class="inactive")
+    r.user.me().subreddit.flair.set(user, text="inactive", css_class="inactive")
     INACTIVE_LIST.add(user)
 
 
@@ -552,14 +556,14 @@ def find_canonical(name, fast=False):
     for query in "url:\"{}\"".format(url), "title:\"{}\"".format(name):
         try:
             for similar in HOME.search(query, limit=250):
-                if similar.title == title and similar.author == ME:
+                if similar.title.lower() == title.lower() and similar.author == ME:
                     return similar
         except Exception as e:
             logging.error("exception searching {} for canonical post: {}".format(query, e))
 
     try:
         for recent in HOME.new(limit=100 if fast else 1000):
-            if recent.title == title and recent.author == ME:
+            if recent.title.lower() == title.lower() and recent.author == ME:
                 logging.info("using recent result for {}".format(name))
                 return recent
             if recent.created_utc < time.time() - 86400:
@@ -578,7 +582,7 @@ def find_canonical(name, fast=False):
                     similar = r.submission(result["id"])
                     if getattr(similar, "removed", None) or getattr(similar, "spam", None):
                         continue
-                    if similar.title == title and similar.author == ME:
+                    if similar.title.lower() == title.lower() and similar.author == ME:
                         logging.info("using Pushshift result for {}".format(name))
                         return similar
     except Exception as e:
@@ -594,7 +598,7 @@ def process_contribution(submission, result, note=None, reply=None, crosspost=No
         logging.warning("exception removing contribution {}: {}".format(submission.permalink, e))
     try:
         if reply:
-            comment = submission.reply(reply)
+            comment = submission.reply(body=reply)
             comment.mod.distinguish()
     except Exception as e:
         logging.warning("exception replying to contribution {}: {}".format(submission.permalink, e))
@@ -626,15 +630,30 @@ def process_contribution(submission, result, note=None, reply=None, crosspost=No
 
 
 def check_contributions():
+    global CONTRIBUTION_LIMIT
+
     logging.info("checking for contributions")
 
-    pause = time.time() + 60
-    for submission in r.multireddit(ME, name="contributions").new(limit=1000):
-        if submission.created_utc < time.time() - 86400 or time.time() >= pause:
-            break
+    # process oldest submissions first
+    submissions = []
+    try:
+        # check submissions
+        for submission in r.multireddit(redditor=ME, name="contributions").new(limit=1000):
+            if submission.created_utc < CONTRIBUTION_LIMIT or submission.created_utc < time.time() - 86400:
+                break
+            if submission.author != ME:
+                submissions.insert(0, submission)
+        # set future limit
+        if submissions:
+            CONTRIBUTION_LIMIT = submissions[0].created_utc - 600
+    except Exception as e:
+        logging.error("exception checking submissions: {}".format(e))
 
-        if submission.author == ME:
-            continue
+    # process submissions for a limited period of time
+    pause = time.time() + 60
+    for submission in submissions:
+        if time.time() >= pause:
+            break
 
         if submission.author in FRIEND_LIST:
             logging.info("contribution from friend /u/{}".format(submission.author))
@@ -659,7 +678,7 @@ def check_contributions():
         name = None
         try:
             user = r.redditor(name=account)
-            user_data = r.get("/api/user_data_by_account_ids", {"ids": user.fullname})
+            user_data = r.get(path="/api/user_data_by_account_ids", params={"ids": user.fullname})
             name = user_data[user.fullname]["name"]
         except Exception as e:
             logging.debug("exception checking account {}: ".format(account, e))
@@ -753,41 +772,68 @@ def check_contributions():
 
 
 def check_notes():
+    global NOTE_FAILURE_CACHE
+    global NOTE_LIMIT
+
     logging.info("checking for notes")
     if not MULTIREDDITS.get("notes"):
         return
-    for comment in r.multireddit(ME, name="contributions").comments(limit=1000):
-        if comment.created_utc < time.time() - 86400:
+
+    # process oldest comments first
+    comments = []
+    try:
+        # check comments
+        for comment in r.multireddit(redditor=ME, name="contributions").comments(limit=1000):
+            if comment.created_utc < NOTE_LIMIT or comment.created_utc < time.time() - 28800:
+                break
+            if comment.locked and comment.author != ME:
+                if comment.created_utc < time.time() - 21600:
+                    logging.warning("unable to create note for {}".format(comment.permalink))
+                    comment.mod.unlock()
+                else:
+                    comments.insert(0, comment)
+        # set future limit
+        if comments:
+            NOTE_LIMIT = comments[0].created_utc - 600
+    except Exception as e:
+        logging.error("exception checking comments: {}".format(e))
+
+    # process comments for a limited period of time
+    pause = time.time() + 60
+    skipped = set()
+    for comment in comments:
+        if time.time() >= pause:
             break
 
-        if comment.author == ME:
-            continue
-
-        # only locked comments are used as notes
-        if not comment.locked:
-            continue
-
-        account = None
-        if comment.submission.url:
-            m = re.search("^https?://(?:\w+\.)?reddit\.com/u(?:ser)?/([\w-]{3,20})", comment.submission.url)
-            if m:
-                account = m.group(1)
-        if not account:
-            comment.mod.unlock()
-            continue
-
-        canonical = None
-        if comment.subreddit == HOME and comment.submission.author == ME:
-            canonical = comment.submission
-        else:
-            canonical = find_canonical(account)
-        if not canonical:
-            if comment.created_utc < time.time() - 43200:
-                logging.warning("unable to create note for {}".format(comment.permalink))
-                comment.mod.unlock()
+        # skip new comments
+        if comment.created_utc > time.time() - 120:
             continue
 
         try:
+            account = None
+            if comment.submission.url:
+                m = re.search("^https?://(?:\w+\.)?reddit\.com/u(?:ser)?/([\w-]{3,20})", comment.submission.url)
+                if m:
+                    account = m.group(1)
+            if not account:
+                comment.mod.unlock()
+                continue
+
+            # skip recent failures
+            if NOTE_FAILURE_CACHE.get(account):
+                skipped.add(comment.id)
+                continue
+
+            canonical = None
+            if comment.subreddit == HOME and comment.submission.author == ME:
+                canonical = comment.submission
+            else:
+                canonical = find_canonical(account)
+            if not canonical:
+                NOTE_FAILURE_CACHE[account] = time.time()
+                logging.warning("unable to find canonical post for {}".format(comment.permalink))
+                continue
+
             for post in set(canonical.duplicates()):
                 if post.author != ME:
                     continue
@@ -798,11 +844,11 @@ def check_notes():
                 attribution = "Note from /u/{} at {}".format(comment.author, comment.permalink)
                 logging.info("creating note for {} on {}".format(comment.permalink, post.permalink))
                 try:
-                    post.reply("{}:\n\n---\n\n{}".format(attribution, comment.body))
+                    post.reply(body="{}:\n\n---\n\n{}".format(attribution, comment.body))
                 except praw.exceptions.RedditAPIException as e:
                     logging.warning("exception creating note for {}, trying again with short note: {}".format(comment.permalink, e))
                     try:
-                        post.reply("{}.".format(attribution))
+                        post.reply(body="{}.".format(attribution))
                     except Exception as e:
                         logging.error("exception creating note for {}: {}".format(comment.permalink, e))
                 except Exception as e:
@@ -810,6 +856,9 @@ def check_notes():
             comment.mod.unlock()
         except Exception as e:
             logging.error("exception checking for notes: {}".format(e))
+
+    if skipped:
+        logging.info("skipped due to recent failure: {}".format(", ".join(sorted(skipped))))
 
 
 def check_mail():
@@ -929,7 +978,8 @@ def check_modmail():
                 continue
             # handled check
             if ME in thread.authors:
-                if next((m for m in thread.messages if m.author == ME and m.is_internal), None):
+                # workaround for https://github.com/praw-dev/praw/issues/1870
+                if next((m for m in thread.owner.modmail(thread.id).messages if m.author == ME and m.is_internal), None):
                     continue
             # home check
             if thread.owner == HOME:
@@ -974,10 +1024,10 @@ def check_modmail():
                     if canonical.link_flair_text == "banned":
                         try:
                             if thread.user.mute_status.get("muteCount") == 0:
-                                thread.reply(APPEAL_MESSAGE.format(HOME), author_hidden=True)
+                                thread.reply(body=APPEAL_MESSAGE.format(HOME), author_hidden=True)
                         except Exception as e:
                             logging.warning("exception handling appeal {}: {}".format(thread, e))
-                    thread.reply(note, internal=True)
+                    thread.reply(body=note, internal=True)
                 continue
             # banned check
             for ban in thread.owner.banned(account):
@@ -992,7 +1042,7 @@ def check_modmail():
             canonical = find_canonical(str(account), fast=True)
             if canonical:
                 logging.info("creating note about /u/{} on /r/{}".format(account, thread.owner))
-                thread.reply(NOTE_LONG.format(account, HOME, canonical.permalink, thread.owner), internal=True)
+                thread.reply(body=NOTE_LONG.format(account, HOME, canonical.permalink, thread.owner), internal=True)
     except Exception as e:
         logging.error("exception checking modmail {}: {}".format(thread, e))
 
@@ -1056,7 +1106,7 @@ def check_state():
                     edited[log.target_fullname].append(str(log.id))
                 else:
                     edited[log.target_fullname] = [str(log.id)]
-        for submission in r.info(edited.keys()):
+        for submission in r.info(fullnames=edited.keys()):
             try:
                 # skip removed and deleted submissions
                 if getattr(submission, "removed_by_category", None):
@@ -1090,6 +1140,7 @@ def check_state():
     # trim time-based caches
     expire_cache(COMMENT_CACHE, 3600)
     expire_cache(LOG_CACHE, 86400)
+    expire_cache(NOTE_FAILURE_CACHE, 3600)
     expire_cache(WHITELIST_CACHE, 3600)
 
 
