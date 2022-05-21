@@ -651,6 +651,7 @@ def check_contributions():
 
     # process submissions for a limited period of time
     pause = time.time() + 60
+    moderators = None
     for submission in submissions:
         if time.time() >= pause:
             break
@@ -661,42 +662,44 @@ def check_contributions():
             if consider_action(submission, link):
                 continue
 
-        # wait for flair unless exempted
-        if not (submission.link_flair_text or submission.subreddit.subreddit_type == "private" or HOME.moderator(submission.author)):
-            continue
-
+        # require account
         account = None
         if submission.url:
             m = re.search("^https?://(?:\w+\.)?reddit\.com/u(?:ser)?/([\w-]{3,20})", submission.url)
             if m:
                 account = m.group(1)
-
-        # skip non-conforming submissions
         if not account:
+            continue
+
+        # fetch moderator list once
+        if moderators is None:
+            moderators = list(map(str, HOME.moderator()))
+
+        # wait for flair unless exempted
+        if not (submission.link_flair_text or submission.author in moderators or submission.subreddit.subreddit_type == "private"):
             continue
 
         name = None
         try:
-            user = r.redditor(name=account)
-            user_data = r.get(path="/api/user_data_by_account_ids", params={"ids": user.fullname})
-            name = user_data[user.fullname]["name"]
+            user = r.get(path=f"/user/{account}/about/")
+            name = user.name
         except Exception as e:
             logging.debug("exception checking account {}: ".format(account, e))
 
-        if not name:
+        if not name or getattr(user, "is_suspended", None):
             reply = ("Thank you for your submission! That account does not appear to exist"
                      " (perhaps it has already been suspended, banned, or deleted), but"
                      " please message /r/{} if you believe this was an error.".format(HOME))
             process_contribution(submission, "rejected", reply=reply)
             continue
 
-        if submission.author == user and not HOME.moderator(submission.author):
+        if submission.author == user and submission.author not in moderators:
             process_contribution(submission, "blocked", note="(submitter account)")
             HOME.banned.add(submission.author, ban_message="Submitting your own account is not allowed.",
                             note="submitted their own account {}".format(submission.permalink))
             continue
 
-        if HOME.moderator(user) and not HOME.moderator(submission.author):
+        if user in moderators and submission.author not in moderators:
             process_contribution(submission, "blocked", note="(moderator account)")
             HOME.banned.add(submission.author, ban_message="Submitting a moderator account is not allowed.",
                             note="submitted moderator account {}".format(submission.permalink))
