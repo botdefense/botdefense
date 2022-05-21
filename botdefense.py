@@ -604,14 +604,13 @@ def process_contribution(submission, result, note=None, reply=None, crosspost=No
         logging.warning("exception replying to contribution {}: {}".format(submission.permalink, e))
     try:
         if crosspost:
+            duplicates = set(crosspost.duplicates())
             for subreddit in MULTIREDDITS.get("crossposts", set()):
                 available = False
-                for iterator in subreddit.search("url:\"{}\"".format(crosspost.url)), subreddit.new():
-                    if not available:
-                        for post in iterator:
-                            if not post.archived and post.title == crosspost.title and post.author == ME:
-                                available = True
-                                break
+                for post in duplicates:
+                    if post.subreddit == subreddit and not post.removed_by_category and not post.archived and post.title == crosspost.title and post.author == ME:
+                        available = True
+                        break
                 if not available:
                     # submissions from private subreddits cannot be crossposted
                     if crosspost.subreddit.subreddit_type == "private":
@@ -638,7 +637,10 @@ def check_contributions():
     submissions = []
     try:
         # check submissions
+        newest = None
         for submission in r.multireddit(redditor=ME, name="contributions").new(limit=1000):
+            if newest is None:
+                newest = submission
             if submission.created_utc < CONTRIBUTION_LIMIT or submission.created_utc < time.time() - 86400:
                 break
             if submission.author != ME:
@@ -646,6 +648,8 @@ def check_contributions():
         # set future limit
         if submissions:
             CONTRIBUTION_LIMIT = submissions[0].created_utc - 600
+        elif newest:
+            CONTRIBUTION_LIMIT = newest.created_utc - 3600
     except Exception as e:
         logging.error("exception checking submissions: {}".format(e))
 
@@ -786,7 +790,10 @@ def check_notes():
     comments = []
     try:
         # check comments
+        newest = None
         for comment in r.multireddit(redditor=ME, name="contributions").comments(limit=1000):
+            if newest is None:
+                newest = comment
             if comment.created_utc < NOTE_LIMIT or comment.created_utc < time.time() - 28800:
                 break
             if comment.locked and comment.author != ME:
@@ -798,6 +805,8 @@ def check_notes():
         # set future limit
         if comments:
             NOTE_LIMIT = comments[0].created_utc - 600
+        elif newest:
+            NOTE_LIMIT = newest.created_utc - 3600
     except Exception as e:
         logging.error("exception checking comments: {}".format(e))
 
