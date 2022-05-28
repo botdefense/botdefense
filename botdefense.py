@@ -9,7 +9,6 @@ from datetime import datetime
 import random
 import praw
 import prawcore.exceptions
-import requests
 import yaml
 
 
@@ -460,7 +459,6 @@ def is_friend(user):
     try:
         return r.get(path=f"/api/v1/me/friends/{user}") == str(user)
     except Exception as e:
-        print(vars(e))
         if type(e) == praw.exceptions.RedditAPIException and e.items[0].error_type in ["NOT_FRIEND", "USER_DOESNT_EXIST"]:
             return False
         logging.warning("exception checking friends for /u/{}: {}".format(user, e))
@@ -549,45 +547,35 @@ def unban(account, subreddit):
         logging.warning("error checking ban for /u/{} in /r/{}: {}".format(account, subreddit, e))
 
 
-def find_canonical(name, fast=False):
+def find_canonical(name):
     title = "overview for " + name
     url = "https://www.reddit.com/user/" + name
 
-    for query in "url:\"{}\"".format(url), "title:\"{}\"".format(name):
-        try:
-            for similar in HOME.search(query, limit=250):
-                if similar.title.lower() == title.lower() and similar.author == ME:
-                    return similar
-        except Exception as e:
-            logging.error("exception searching {} for canonical post: {}".format(query, e))
+    try:
+        for post in r.info(url=url):
+            if post.title.lower() == title.lower() and post.author == ME and post.subreddit == HOME and not post.removed_by_category:
+                logging.info("using info result for {}".format(name))
+                return post
+    except Exception as e:
+        logging.error("exception querying for canonical post: {}".format(e))
 
     try:
-        for recent in HOME.new(limit=100 if fast else 1000):
-            if recent.title.lower() == title.lower() and recent.author == ME:
-                logging.info("using recent result for {}".format(name))
-                return recent
-            if recent.created_utc < time.time() - 86400:
-                break
+        for post in HOME.search(f'title:"{name}"', limit=250):
+            if post.title.lower() == title.lower() and post.author == ME:
+                logging.info("using search result for {}".format(name))
+                return post
     except Exception as e:
-        logging.error("exception checking recent posts for canonical post: {}".format(e))
+        logging.error("exception searching for canonical post: {}".format(e))
 
     try:
-        query = { "q": f'"{name}"', "author": ME, "subreddit": f'{HOME}', "limit": 100 }
-        response = requests.get("https://api.pushshift.io/reddit/submission/search", timeout=15, params=query)
-        response.raise_for_status()
-        results = response.json()
-        if type(results) is dict and type(results.get("data")) is list:
-            for result in results["data"]:
-                if type(result) is dict and result.get("id") and result.get("url") == url:
-                    similar = r.submission(result["id"])
-                    if getattr(similar, "removed", None) or getattr(similar, "spam", None):
-                        continue
-                    if similar.title.lower() == title.lower() and similar.author == ME:
-                        logging.info("using Pushshift result for {}".format(name))
-                        return similar
+        for post in HOME.new(limit=100):
+            if post.title.lower() == title.lower() and post.author == ME:
+                logging.info("using new result for {}".format(name))
+                return post
     except Exception as e:
-        logging.error("exception querying Pushshift for canonical post: {}".format(e))
+        logging.error("exception checking new for canonical post: {}".format(e))
 
+    logging.info("no result for {}".format(name))
     return None
 
 
@@ -605,6 +593,15 @@ def process_contribution(submission, result, note=None, reply=None, crosspost=No
     try:
         if crosspost:
             duplicates = set(crosspost.duplicates())
+            # multiple canonical check
+            canonicals = set({crosspost.permalink})
+            for post in duplicates:
+                if post.subreddit == HOME and post.author == ME and not post.removed_by_category:
+                    canonicals.add(post.permalink)
+            if len(canonicals) > 1:
+                logging.error("multiple canonical posts: {}".format(", ".join(sorted(canonicals))))
+                HOME.message("Multiple canonical posts", "\n\n".join(sorted(canonicals)))
+            # make any crossposts
             for subreddit in MULTIREDDITS.get("crossposts", set()):
                 available = False
                 for post in duplicates:
@@ -846,26 +843,31 @@ def check_notes():
                 logging.warning("unable to find canonical post for {}".format(comment.permalink))
                 continue
 
+            unlock = False
             for post in set(canonical.duplicates()):
                 if post.author != ME:
                     continue
                 if post.subreddit not in MULTIREDDITS.get("notes", set()):
                     continue
                 if post == comment.submission:
+                    unlock = True
                     continue
                 attribution = "Note from /u/{} at {}".format(comment.author, comment.permalink)
                 logging.info("creating note for {} on {}".format(comment.permalink, post.permalink))
                 try:
                     post.reply(body="{}:\n\n---\n\n{}".format(attribution, comment.body))
+                    unlock = True
                 except praw.exceptions.RedditAPIException as e:
                     logging.warning("exception creating note for {}, trying again with short note: {}".format(comment.permalink, e))
                     try:
                         post.reply(body="{}.".format(attribution))
+                        unlock = True
                     except Exception as e:
                         logging.error("exception creating note for {}: {}".format(comment.permalink, e))
                 except Exception as e:
                     logging.error("exception creating note for {}: {}".format(comment.permalink, e))
-            comment.mod.unlock()
+            if unlock:
+                comment.mod.unlock()
         except Exception as e:
             logging.error("exception checking for notes: {}".format(e))
 
@@ -995,7 +997,7 @@ def check_modmail():
                     continue
             # home check
             if thread.owner == HOME:
-                canonical = find_canonical(str(account), fast=True)
+                canonical = find_canonical(str(account))
                 if canonical and canonical.link_flair_text:
                     logging.info("creating note about /u/{} on /r/{}".format(account, thread.owner))
                     note = NOTE_SHORT.format(account, canonical.link_flair_text, canonical.permalink)
@@ -1051,7 +1053,7 @@ def check_modmail():
             if not option(thread.owner, "modmail_notes"):
                 continue
             # create note
-            canonical = find_canonical(str(account), fast=True)
+            canonical = find_canonical(str(account))
             if canonical:
                 logging.info("creating note about /u/{} on /r/{}".format(account, thread.owner))
                 thread.reply(body=NOTE_LONG.format(account, HOME, canonical.permalink, thread.owner), internal=True)
@@ -1121,7 +1123,7 @@ def check_state():
         for submission in r.info(fullnames=edited.keys()):
             try:
                 # skip removed and deleted submissions
-                if getattr(submission, "removed_by_category", None):
+                if submission.removed_by_category:
                     continue
                 # sync the submission
                 sync_submission(submission)
