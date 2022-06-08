@@ -26,8 +26,6 @@ NOTE_FAILURE_CACHE = {}
 NOTE_LIMIT = 0
 WHITELIST_CACHE = {}
 SUBMISSION_IDS = []
-QUEUE_LIST = []
-QUEUE_COUNTER = 0
 MODMAIL_IDS = []
 OPTIONS_DEFAULT = { "modmail_mute": True, "modmail_notes": False }
 OPTIONS_DISABLED = { "modmail_mute": False, "modmail_notes": False }
@@ -61,17 +59,11 @@ UNBAN_STATE = {}
 
 # setup logging
 class LengthFilter(logging.Filter):
-    retry = None
-
     def filter(self, record):
         if record.funcName == '_do_retry' and record.msg.endswith('/about/modqueue/'):
             m = re.search(r'/r/([\w-]+\+)+[\w-]+/', record.msg)
             if m:
                 record.msg = record.msg.replace(m.group(0), f'/r/[{m.group(0).count("+") + 1} subreddits]/')
-                if self.retry and self.retry[0] == hash(m.group(0)) and 60 < time.time() - self.retry[1] < 300:
-                    split_subreddits()
-                    record.msg += " (splitting subreddits)"
-                self.retry = (hash(m.group(0)), time.time())
         return True
 
 
@@ -247,7 +239,7 @@ def option(subreddit, name):
 
 
 def load_configuration(subreddit):
-    if subreddit in MULTIREDDITS.get("restricted", set()):
+    if str(subreddit) in MULTIREDDITS.get("restricted", set()):
         return OPTIONS_DISABLED
     configuration = OPTIONS_DEFAULT
     try:
@@ -262,30 +254,17 @@ def load_configuration(subreddit):
     return configuration
 
 
-def split_subreddits():
-    global QUEUE_LIST
-
-    results = []
+def random_subreddits(length=6272, separator='+'):
     try:
-        subreddits = list(filter(lambda s: ':' not in str(s) and s.subreddit_type != "private", SUBREDDIT_LIST))
-        if not subreddits:
-            return
-        random.shuffle(subreddits)
-        subreddits = map(str, subreddits)
-        current = next(subreddits)
-        for subreddit in subreddits:
-            # queue requests are limited to 500 subreddits
-            # bad request errors start around 6358 bytes for queue requests with limit=100, only="submissions"
-            if current.count('+') + 1 == 500 or len(current) + len(subreddit) > 6272:
-                results.append(current)
-                current = subreddit
-            else:
-                current += '+' + subreddit
-        results.append(current)
+        # queue requests are limited to 500 subreddits
+        subreddits = separator.join(random.sample(list(SUBREDDIT_LIST), k=min(500, len(SUBREDDIT_LIST))))
+        # bad request errors start at 6358 bytes for queue requests with limit=100, only="submissions"
+        if len(subreddits) > length:
+            subreddits = subreddits[:subreddits.rindex(separator, 0, length+1)]
+        return subreddits
     except Exception as e:
         logging.error("error slicing subreddits: {}".format(e))
         return
-    QUEUE_LIST = results
 
 
 def load_subreddits():
@@ -293,16 +272,16 @@ def load_subreddits():
     global MULTIREDDITS
 
     logging.info("loading subreddits")
-    subreddits = set(r.user.me().moderated())
+    subreddits = set(map(str, r.user.me().moderated()))
     if subreddits:
         SUBREDDIT_LIST = subreddits
-        split_subreddits()
     else:
         raise RuntimeError("empty subreddit list")
     MULTIREDDITS = {}
     for multireddit in r.user.multireddits():
         name = re.sub(r'\d+', '', multireddit.name)
-        MULTIREDDITS[name] = set.union(MULTIREDDITS.get(name, set()), set(multireddit.subreddits))
+        multireddit.subreddits = set(map(str, multireddit.subreddits))
+        MULTIREDDITS[name] = set.union(MULTIREDDITS.get(name, set()), multireddit.subreddits)
 
 
 def check_comments():
@@ -349,14 +328,9 @@ def check_submissions():
 
 
 def check_queue():
-    global QUEUE_LIST
-    global QUEUE_COUNTER
-
     logging.info("checking queue")
     try:
-        if not QUEUE_LIST:
-            return
-        subreddits = QUEUE_LIST[QUEUE_COUNTER % len(QUEUE_LIST)]
+        subreddits = random_subreddits()
         for submission in r.subreddit(subreddits).mod.modqueue(limit=100, only="submissions"):
             if submission.author in FRIEND_LIST:
                 link = "https://www.reddit.com/comments/{}".format(submission.id)
@@ -368,7 +342,6 @@ def check_queue():
         if error.startswith("<html>"):
             error = error.replace("\n", "")
         logging.error("exception checking queue: {}".format(error))
-    QUEUE_COUNTER += 1
 
 
 def consider_action(post, link):
@@ -377,7 +350,7 @@ def consider_action(post, link):
     account = post.author
     subreddit = post.subreddit
 
-    if subreddit not in SUBREDDIT_LIST:
+    if str(subreddit) not in SUBREDDIT_LIST:
         return False
 
     activity = (str(account), str(subreddit))
@@ -518,7 +491,7 @@ def ban(account, subreddit, link, mail):
         date = str(datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d"))
         message = BAN_MESSAGE.format(subreddit, HOME, account)
         note = "/u/{} banned by /u/{} at {} for {}".format(account, ME, date, link)
-        if subreddit in MULTIREDDITS.get("restricted", set()):
+        if str(subreddit) in MULTIREDDITS.get("restricted", set()):
             message = BAN_MESSAGE_SHORT.format(subreddit)
             note = "/u/{} banned at {} for {}".format(account, date, link)
         subreddit.banned.add(account, ban_message=message, note=note)
@@ -611,7 +584,7 @@ def process_contribution(submission, result, note=None, reply=None, crosspost=No
                 if not available:
                     # submissions from private subreddits cannot be crossposted
                     if crosspost.subreddit.subreddit_type == "private":
-                        subreddit.submit(crosspost.title, url=submission.url, send_replies=False)
+                        r.subreddit(subreddit).submit(crosspost.title, url=submission.url, send_replies=False)
                     else:
                         crosspost.crosspost(subreddit, send_replies=False)
     except Exception as e:
@@ -847,7 +820,7 @@ def check_notes():
             for post in set(canonical.duplicates()):
                 if post.author != ME:
                     continue
-                if post.subreddit not in MULTIREDDITS.get("notes", set()):
+                if str(post.subreddit) not in MULTIREDDITS.get("notes", set()):
                     continue
                 if post == comment.submission:
                     unlock = True
@@ -954,7 +927,7 @@ def check_mail():
                 message.mark_read()
                 load_subreddits()
                 schedule(load_subreddits, when="defer")
-                if subreddit not in SUBREDDIT_LIST:
+                if str(subreddit) not in SUBREDDIT_LIST:
                     logging.info("removed as moderator from /r/{}".format(subreddit))
             # some other type of subreddit message
             else:
@@ -1019,7 +992,7 @@ def check_modmail():
                     for post in set(canonical.duplicates()):
                         if post.author != ME:
                             continue
-                        if post.subreddit not in MULTIREDDITS.get("notes", set()):
+                        if str(post.subreddit) not in MULTIREDDITS.get("notes", set()):
                             continue
                         authors = set()
                         for comment in post.comments.list():
@@ -1073,7 +1046,7 @@ def join_subreddit(subreddit):
             return False, "quarantined"
         elif subreddit.subreddit_type not in ["public", "restricted", "gold_only", "user"]:
             return False, subreddit.subreddit_type
-        elif subreddit in MULTIREDDITS.get("prohibited", set()):
+        elif str(subreddit) in MULTIREDDITS.get("prohibited", set()):
             HOME.message("Invitation from prohibited subreddit", "/r/{}".format(subreddit))
             return False, "prohibited"
     except prawcore.exceptions.Forbidden:
@@ -1086,8 +1059,8 @@ def join_subreddit(subreddit):
 
     try:
         subreddit.mod.accept_invite()
-        SUBREDDIT_LIST.add(subreddit)
-        if subreddit in MULTIREDDITS.get("restricted", set()):
+        SUBREDDIT_LIST.add(str(subreddit))
+        if str(subreddit) in MULTIREDDITS.get("restricted", set()):
             HOME.message("Joined restricted subreddit", "/r/{}".format(subreddit))
     except Exception as e:
         if e.items[0].error_type == "NO_INVITE_FOUND" and subreddit.moderator(ME):
