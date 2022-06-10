@@ -27,35 +27,36 @@ NOTE_LIMIT = 0
 WHITELIST_CACHE = {}
 SUBMISSION_IDS = []
 MODMAIL_IDS = []
+UNBAN_STATE = {}
 OPTIONS_DEFAULT = { "modmail_mute": True, "modmail_notes": False }
 OPTIONS_DISABLED = { "modmail_mute": False, "modmail_notes": False }
-BAN_MESSAGE = ("Bots and bot-like accounts are not welcome on /r/{0}.\n\n"
-               "[I am a bot, and this action was performed automatically]"
-               "(/r/{1}/wiki/index). "
-               "If you wish to appeal the classification of the /u/{2} account, please "
-               "[message /r/{1}]"
-               "(https://www.reddit.com/message/compose?"
-               "to=/r/{1}&subject=Ban%20dispute%20for%20/u/{2}%20on%20/r/{0}) "
-               "rather than replying to this message.")
-BAN_MESSAGE_SHORT = "Bots and bot-like accounts are not welcome on /r/{}."
-PERMISSIONS_MESSAGE = ("Thank you for adding {}!\n\n"
-                       "This bot works best with `access` and `posts` permissions "
-                       "(current permissions: {}). "
-                       "For more information, [please read this guide](/r/{}/wiki/index).")
-NOTE_SHORT = "/u/{0} is [currently classified as **{1}**]({2}).\n\n"
-NOTE_LONG = ("Private Moderator Note: /u/{0} is [listed on /r/{1}]({2}).\n\n"
-             "- If this account is claiming to be human and isn't an obvious novelty account, "
-             "we recommend asking the account owner to [message /r/{1}]"
-             "(https://www.reddit.com/message/compose?"
-             "to=/r/{1}&subject=Ban%20dispute%20for%20/u/{0}%20on%20/r/{3}).\n"
-             "- If this account is a bot that you wish to allow, remember to [whitelist]"
-             "(/r/{1}/wiki/index) it before you unban it.")
-APPEAL_MESSAGE = ("Your classification appeal has been received and will be reviewed by a "
-                  "moderator. If accepted, the result of your appeal will apply to any "
-                  "subreddit using /r/{}.\n\n*This is an automated message.*")
-REPORT_REASON = "bot or bot-like account (moderator permissions limited to reporting)"
-UNBAN_STATE = {}
-
+CONFIGURATION_DEFAULT = {
+    "ban_message": ("Bots and bot-like accounts are not welcome on /r/{subreddit}.\n\n"
+                    "[I am a bot, and this action was performed automatically]"
+                    "(/r/{home}/wiki/index). "
+                    "If you wish to appeal the classification of the /u/{account} account, please "
+                    "[message /r/{home}]"
+                    "(https://www.reddit.com/message/compose?"
+                    "to=/r/{home}&subject=Ban%20dispute%20for%20/u/{account}%20on%20/r/{subreddit}) "
+                    "rather than replying to this message."),
+    "ban_message_short": "Bots and bot-like accounts are not welcome on /r/{subreddit}.",
+    "permissions_message": ("Thank you for adding {me}!\n\n"
+                            "This bot works best with `access` and `posts` permissions "
+                            "(current permissions: {permissions}). "
+                            "For more information, [please read this guide](/r/{home}/wiki/index)."),
+    "note_home": "/u/{account} is [currently classified as **{classification}**]({link}).\n\n",
+    "note_other": ("Private Moderator Note: /u/{account} is [listed on /r/{home}]({link}).\n\n"
+                   "- If this account is claiming to be human and isn't an obvious novelty account, "
+                   "we recommend asking the account owner to [message /r/{home}]"
+                   "(https://www.reddit.com/message/compose?"
+                   "to=/r/{home}&subject=Ban%20dispute%20for%20/u/{account}%20on%20/r/{subreddit}).\n"
+                   "- If this account is a bot that you wish to allow, remember to [whitelist]"
+                   "(/r/{home}/wiki/index) it before you unban it."),
+    "appeal_message": ("Your classification appeal has been received and will be reviewed by a "
+                       "moderator. If accepted, the result of your appeal will apply to any "
+                       "subreddit using /r/{home}.\n\n*This is an automated message.*"),
+    "report_reason": "bot or bot-like account (moderator permissions limited to reporting)",
+}
 
 # setup logging
 class LengthFilter(logging.Filter):
@@ -233,38 +234,49 @@ def load_flair():
     logging.info("loaded {} inactive".format(len(inactive)))
 
 
-def option(subreddit, name):
-    configuration = load_configuration(subreddit)
-    return configuration.get(name)
+def option(subreddit, value, default=None):
+    if subreddit == HOME and CONFIGURATION:
+        return CONFIGURATION.get(value, default)
+    options = load_configuration(subreddit)
+    return options.get(value, default)
 
 
-def load_configuration(subreddit):
+def load_configuration(subreddit=None):
+    global CONFIGURATION
+
+    if subreddit is None:
+        subreddit = HOME
     if str(subreddit) in MULTIREDDITS.get("restricted", set()):
         return OPTIONS_DISABLED
-    configuration = OPTIONS_DEFAULT
+    options = OPTIONS_DEFAULT
+    if subreddit == HOME:
+        options.update(CONFIGURATION_DEFAULT)
     try:
         wiki = subreddit.wiki[ME.lower()]
-        if wiki and 0 < len(wiki.content_md) < 256:
-            configuration = yaml.safe_load(wiki.content_md)
+        if wiki and 0 < len(wiki.content_md) < 4096:
+            wiki_options = yaml.safe_load(wiki.content_md)
+            options.update(wiki_options)
             logging.info("loaded configuration for /r/{}".format(subreddit))
+            if subreddit == HOME:
+                CONFIGURATION = options
     except (prawcore.exceptions.Forbidden, prawcore.exceptions.NotFound) as e:
         logging.debug("unable to read configuration for /r/{}: {}".format(subreddit, e))
     except Exception as e:
         logging.error("exception loading configuration for /r/{}: {}".format(subreddit, e))
-    return configuration
+    return options
 
 
-def random_subreddits(length=6272, separator='+'):
+def random_subreddits(subreddits, length=6272, separator='+'):
     try:
         # queue requests are limited to 500 subreddits
-        subreddits = separator.join(random.sample(list(SUBREDDIT_LIST), k=min(500, len(SUBREDDIT_LIST))))
+        sample = separator.join(random.sample(subreddits, k=min(500, len(subreddits))))
         # bad request errors start at 6358 bytes for queue requests with limit=100, only="submissions"
-        if len(subreddits) > length:
-            subreddits = subreddits[:subreddits.rindex(separator, 0, length+1)]
-        return subreddits
+        if len(sample) > length:
+            sample = sample[:sample.rindex(separator, 0, length+1)]
+        return sample
     except Exception as e:
         logging.error("error slicing subreddits: {}".format(e))
-        return
+        return None
 
 
 def load_subreddits():
@@ -330,13 +342,24 @@ def check_submissions():
 def check_queue():
     logging.info("checking queue")
     try:
-        subreddits = random_subreddits()
-        for submission in r.subreddit(subreddits).mod.modqueue(limit=100, only="submissions"):
-            if submission.author in FRIEND_LIST:
-                link = "https://www.reddit.com/comments/{}".format(submission.id)
-                logging.info("queue hit for /u/{} in /r/{} at {}".format(submission.author,
-                                                                         submission.subreddit, link))
-                consider_action(submission, link)
+        # primary query
+        exclusions = option(HOME, "modqueue_exclusions", [])
+        subreddits = SUBREDDIT_LIST.difference(exclusions) if exclusions else SUBREDDIT_LIST
+        queries = [random_subreddits(list(subreddits))]
+        # separately query excluded subreddits
+        for exclusion in exclusions:
+            if random.random() < 500 / len(SUBREDDIT_LIST):
+                queries.append(exclusion)
+        for query in queries:
+            if not query:
+                continue
+            limit = 5 if query in exclusions else 100
+            for submission in r.subreddit(query).mod.modqueue(limit=limit, only="submissions"):
+                if submission.author in FRIEND_LIST:
+                    link = "https://www.reddit.com/comments/{}".format(submission.id)
+                    logging.info("queue hit for /u/{} in /r/{} at {}".format(submission.author,
+                                                                             submission.subreddit, link))
+                    consider_action(submission, link)
     except Exception as e:
         error = str(e)
         if error.startswith("<html>"):
@@ -417,7 +440,7 @@ def consider_action(post, link):
     elif permissions:
         try:
             logging.info("reporting {} by /u/{} after {} seconds".format(link, account, delay))
-            post.report(REPORT_REASON)
+            post.report(option(HOME, "report_reason"))
         except Exception as e:
             logging.error("error reporting {}: {}".format(link, e))
     return True
@@ -489,10 +512,10 @@ def ban(account, subreddit, link, mail):
 
     try:
         date = str(datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d"))
-        message = BAN_MESSAGE.format(subreddit, HOME, account)
+        message = option(HOME, "ban_message").format(subreddit=subreddit, home=HOME, account=account)
         note = "/u/{} banned by /u/{} at {} for {}".format(account, ME, date, link)
         if str(subreddit) in MULTIREDDITS.get("restricted", set()):
-            message = BAN_MESSAGE_SHORT.format(subreddit)
+            message = option(HOME, "ban_message_short").format(subreddit=subreddit)
             note = "/u/{} banned at {} for {}".format(account, date, link)
         subreddit.banned.add(account, ban_message=message, note=note)
         logging.info("banned /u/{} in /r/{}".format(account, subreddit))
@@ -874,7 +897,7 @@ def check_mail():
                 if message.author in ["[deleted]", "mod_mailer"]:
                     continue
                 if message.author in FRIEND_LIST or message.author.moderated():
-                    message.reply("I am a bot. If this is regarding {}, please message /r/{}. For anything else, please message the relevant subreddit.".format(ME, HOME))
+                    message.reply(body="I am a bot. If this is regarding {}, please message /r/{}. For anything else, please message the relevant subreddit.".format(ME, HOME))
                 continue
 
             subreddit = message.subreddit
@@ -906,8 +929,11 @@ def check_mail():
                         if not "access" in permissions or not "posts" in permissions:
                             if not permissions:
                                 permissions = ["*no permissions*"]
-                            logging.info("incorrect permissions ({}) on /r/{}".format(", ".join(permissions), subreddit))
-                            message.reply(PERMISSIONS_MESSAGE.format(ME, ", ".join(permissions), HOME))
+                            permissions_string = ", ".join(permissions)
+                            logging.info("incorrect permissions ({}) on /r/{}".format(permissions_string, subreddit))
+                            reply = option(HOME, "permissions_message")
+                            if reply:
+                                message.reply(body=reply.format(me=ME, permissions=permissions_string, home=HOME))
                 else:
                     message.mark_read()
                     if reason == "error":
@@ -918,7 +944,7 @@ def check_mail():
                         logging.warning("ignoring invite from {} subreddit /r/{}".format(reason, subreddit))
                     else:
                         logging.info("declining invite from {} subreddit /r/{}".format(reason, subreddit))
-                        message.reply(
+                        message.reply(body=
                             "This bot isn't really needed on non-public subreddits due to very limited bot"
                             " activity. If you believe this was sent in error, please message /r/{}.".format(HOME)
                         )
@@ -973,7 +999,7 @@ def check_modmail():
                 canonical = find_canonical(str(account))
                 if canonical and canonical.link_flair_text:
                     logging.info("creating note about /u/{} on /r/{}".format(account, thread.owner))
-                    note = NOTE_SHORT.format(account, canonical.link_flair_text, canonical.permalink)
+                    note = option(HOME, "note_home").format(account=account, classification=canonical.link_flair_text, link=canonical.permalink)
                     try:
                         mod_reports = canonical.mod_reports_dismissed + canonical.mod_reports
                     except AttributeError:
@@ -1011,7 +1037,7 @@ def check_modmail():
                     if canonical.link_flair_text == "banned":
                         try:
                             if thread.user.mute_status.get("muteCount") == 0:
-                                thread.reply(body=APPEAL_MESSAGE.format(HOME), author_hidden=True)
+                                thread.reply(body=option(HOME, "appeal_message").format(home=HOME), author_hidden=True)
                         except Exception as e:
                             logging.warning("exception handling appeal {}: {}".format(thread, e))
                     thread.reply(body=note, internal=True)
@@ -1028,8 +1054,10 @@ def check_modmail():
             # create note
             canonical = find_canonical(str(account))
             if canonical:
-                logging.info("creating note about /u/{} on /r/{}".format(account, thread.owner))
-                thread.reply(body=NOTE_LONG.format(account, HOME, canonical.permalink, thread.owner), internal=True)
+                reply = option(HOME, "note_other")
+                if reply:
+                    logging.info("creating note about /u/{} on /r/{}".format(account, thread.owner))
+                    thread.reply(body=reply.format(account=account, home=HOME, link=canonical.permalink, subreddit=thread.owner), internal=True)
     except Exception as e:
         logging.error("exception checking modmail {}: {}".format(thread, e))
 
@@ -1228,6 +1256,7 @@ if __name__ == "__main__":
         check_submissions: 30,
         check_unbans: 86400,
         kill_switch: 120,
+        load_configuration: 3600,
         load_flair: 86400,
         load_subreddits: 86400,
         update_status: 900,
@@ -1237,6 +1266,7 @@ if __name__ == "__main__":
     try:
         logging.info("starting")
         schedule(kill_switch, when="next")
+        schedule(load_configuration, when="next")
         schedule(load_flair, when="next")
         schedule(load_subreddits, when="next")
         while True:
