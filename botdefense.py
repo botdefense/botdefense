@@ -16,8 +16,7 @@ import yaml
 STATUS_POST = None
 FRIEND_LIST = set()
 INACTIVE_LIST = set()
-SUBREDDIT_LIST = set()
-MULTIREDDITS = {}
+SUBREDDITS = {}
 COMMENT_AFTER = None
 COMMENT_CACHE = {}
 LOG_CACHE = {}
@@ -39,7 +38,7 @@ CONFIGURATION_DEFAULT = {
                     "(https://www.reddit.com/message/compose?"
                     "to=/r/{home}&subject=Ban%20dispute%20for%20/u/{account}%20on%20/r/{subreddit}) "
                     "rather than replying to this message."),
-    "ban_message_short": "Bots and bot-like accounts are not welcome on /r/{subreddit}.",
+    "ban_note": "/u/{account} banned by /u/{me} at {date} for {reason}",
     "permissions_message": ("Thank you for adding {me}!\n\n"
                             "This bot works best with `access` and `posts` permissions "
                             "(current permissions: {permissions}). "
@@ -62,7 +61,7 @@ CONFIGURATION_DEFAULT = {
 class LengthFilter(logging.Filter):
     def filter(self, record):
         if record.funcName == '_do_retry' and record.msg.endswith('/about/modqueue/'):
-            m = re.search(r'/r/([\w-]+\+)+[\w-]+/', record.msg)
+            m = re.search(r'/r/([\w:-]+\+)+[\w:-]+/', record.msg)
             if m:
                 record.msg = record.msg.replace(m.group(0), f'/r/[{m.group(0).count("+") + 1} subreddits]/')
         return True
@@ -118,6 +117,10 @@ def expire_cache(entries, age):
             deletions.append(key)
     for key in deletions:
         del entries[key]
+
+
+def member(name, element):
+    return str(element) in SUBREDDITS.get(name, set())
 
 
 def kill_switch():
@@ -246,7 +249,7 @@ def load_configuration(subreddit=None):
 
     if subreddit is None:
         subreddit = HOME
-    if str(subreddit) in MULTIREDDITS.get("restricted", set()):
+    if member("restricted", subreddit):
         return OPTIONS_DISABLED
     options = OPTIONS_DEFAULT
     if subreddit == HOME:
@@ -280,20 +283,24 @@ def random_subreddits(subreddits, length=6272, separator='+'):
 
 
 def load_subreddits():
-    global SUBREDDIT_LIST
-    global MULTIREDDITS
+    global SUBREDDITS
 
     logging.info("loading subreddits")
-    subreddits = set(map(str, r.user.me().moderated()))
-    if subreddits:
-        SUBREDDIT_LIST = subreddits
-    else:
+    SUBREDDITS = { "moderated": set(), "nsfw": set() }
+    start = time.time()
+    for subreddit in r.user.me().moderated():
+        SUBREDDITS["moderated"].add(str(subreddit))
+        elapsed = time.time() - start
+        if elapsed < 60 and subreddit.over_18:
+            SUBREDDITS["nsfw"].add(str(subreddit))
+    if not SUBREDDITS.get("moderated"):
         raise RuntimeError("empty subreddit list")
-    MULTIREDDITS = {}
+    if elapsed >= 60:
+        logging.warning("time limit exceeded")
     for multireddit in r.user.multireddits():
         name = re.sub(r'\d+', '', multireddit.name)
         multireddit.subreddits = set(map(str, multireddit.subreddits))
-        MULTIREDDITS[name] = set.union(MULTIREDDITS.get(name, set()), multireddit.subreddits)
+        SUBREDDITS[name] = set.union(SUBREDDITS.get(name, set()), multireddit.subreddits)
 
 
 def check_comments():
@@ -343,12 +350,15 @@ def check_queue():
     logging.info("checking queue")
     try:
         # primary query
+        subreddits = SUBREDDITS.get("moderated", set())
+        total_subreddits = len(subreddits)
         exclusions = option(HOME, "modqueue_exclusions", [])
-        subreddits = SUBREDDIT_LIST.difference(exclusions) if exclusions else SUBREDDIT_LIST
+        if exclusions:
+            subreddits = subreddits.difference(exclusions)
         queries = [random_subreddits(list(subreddits))]
         # separately query excluded subreddits
         for exclusion in exclusions:
-            if random.random() < 500 / len(SUBREDDIT_LIST):
+            if total_subreddits and random.random() < 500 / total_subreddits:
                 queries.append(exclusion)
         for query in queries:
             if not query:
@@ -373,7 +383,7 @@ def consider_action(post, link):
     account = post.author
     subreddit = post.subreddit
 
-    if str(subreddit) not in SUBREDDIT_LIST:
+    if not member("moderated", subreddit):
         return False
 
     activity = (str(account), str(subreddit))
@@ -512,13 +522,22 @@ def ban(account, subreddit, link, mail):
 
     try:
         date = str(datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d"))
-        message = option(HOME, "ban_message").format(subreddit=subreddit, home=HOME, account=account)
-        note = "/u/{} banned by /u/{} at {} for {}".format(account, ME, date, link)
-        if str(subreddit) in MULTIREDDITS.get("restricted", set()):
-            message = option(HOME, "ban_message_short").format(subreddit=subreddit)
-            note = "/u/{} banned at {} for {}".format(account, date, link)
+        message, message_log = option(HOME, "ban_message"), "default"
+        note, note_log = option(HOME, "ban_note"), "default"
+        for group in ["nsfw", "restricted"]:
+            group_message = None
+            group_note = None
+            if member(group, subreddit):
+                group_message = option(HOME, f"ban_message_{group}")
+                group_note = option(HOME, f"ban_note_{group}")
+            if group_message:
+                message, message_log = group_message, group
+            if group_note:
+                note, note_log = group_note, group
+        message = message.format(subreddit=subreddit, home=HOME, account=account)
+        note = note.format(account=account, me=ME, date=date, reason=link)
         subreddit.banned.add(account, ban_message=message, note=note)
-        logging.info("banned /u/{} in /r/{}".format(account, subreddit))
+        logging.info("banned /u/{} in /r/{} ({} message, {} note)".format(account, subreddit, message_log, note_log))
         if mail and option(subreddit, "modmail_mute"):
             logging.info("muting /u/{} in /r/{}".format(account, subreddit))
             subreddit.muted.add(account)
@@ -576,6 +595,7 @@ def find_canonical(name):
 
 
 def process_contribution(submission, result, note=None, reply=None, crosspost=None):
+    note_posts = set()
     try:
         submission.mod.remove()
     except Exception as e:
@@ -596,29 +616,35 @@ def process_contribution(submission, result, note=None, reply=None, crosspost=No
                     canonicals.add(post.permalink)
             if len(canonicals) > 1:
                 logging.error("multiple canonical posts: {}".format(", ".join(sorted(canonicals))))
-                HOME.message("Multiple canonical posts", "\n\n".join(sorted(canonicals)))
+                HOME.message(subject="Multiple canonical posts", message="\n\n".join(sorted(canonicals)))
             # make any crossposts
-            for subreddit in MULTIREDDITS.get("crossposts", set()):
+            for subreddit in SUBREDDITS.get("crossposts", set()):
                 available = False
                 for post in duplicates:
                     if post.subreddit == subreddit and not post.removed_by_category and not post.archived and post.title == crosspost.title and post.author == ME:
                         available = True
+                        if member("notes", post.subreddit):
+                            note_posts.add(post)
                         break
                 if not available:
+                    new = None
                     # submissions from private subreddits cannot be crossposted
                     if crosspost.subreddit.subreddit_type == "private":
-                        r.subreddit(subreddit).submit(crosspost.title, url=submission.url, send_replies=False)
+                        new = r.subreddit(subreddit).submit(crosspost.title, url=submission.url, send_replies=False)
                     else:
-                        crosspost.crosspost(subreddit, send_replies=False)
+                        new = crosspost.crosspost(subreddit, send_replies=False)
+                    if new and member("notes", new.subreddit):
+                        note_posts.add(new)
     except Exception as e:
         logging.warning("exception crossposting {}: {}".format(crosspost.permalink, e))
     note = " " + note if note else ""
     log = "contribution {} from /u/{} with flair {} {}{}".format(submission.permalink, submission.author, submission.link_flair_text, result, note)
     if result == "error":
         logging.error(log)
-        HOME.message("Error processing contribution", "{}".format(submission.permalink))
+        HOME.message(subject="Error processing contribution", message="{}".format(submission.permalink))
     else:
         logging.info(log)
+    return note_posts
 
 
 def check_contributions():
@@ -672,6 +698,23 @@ def check_contributions():
         if moderators is None:
             moderators = list(map(str, HOME.moderator()))
 
+        # set flair if AutoModerator failed
+        try:
+            if not submission.link_flair_text and submission.created_utc < time.time() - 600:
+                flair = None
+                for template in HOME.flair.link_templates:
+                    if template.get("css_class") == "contribution":
+                        flair = template.get("id")
+                        break
+                logging.warning("setting flair for contribution {}".format(submission.permalink))
+                if flair:
+                    submission.mod.flair(flair_template_id=flair)
+                else:
+                    submission.mod.flair(text="contribution", css_class="contribution")
+                continue
+        except Exception as e:
+            logging.error("exception setting flair: {}".format(e))
+
         # wait for flair unless exempted
         if not (submission.link_flair_text or submission.author in moderators or submission.subreddit.subreddit_type == "private"):
             continue
@@ -722,10 +765,11 @@ def check_contributions():
 
         canonical = find_canonical(name)
         post = None
+        report_type = "Reviewable"
+        report_text = None
         try:
             if approved and not canonical:
                 css_class = "pending"
-                report_type = "Reviewable"
                 if submission.link_flair_text:
                     m = re.search("^contribution-(\w+)$", submission.link_flair_text)
                     if m:
@@ -742,22 +786,25 @@ def check_contributions():
                 title = "overview for " + name
                 url = "https://www.reddit.com/user/" + name
                 post = HOME.submit(title, url=url, send_replies=False, flair_id=flair)
-                for attempt in range(3):
-                    try:
-                        post.report("{} submission https://redd.it/{} from /u/{}".format(report_type, submission.id, submission.author))
-                        if css_class != "pending" and flair:
-                            sync_submission(post)
-                            post.mod.approve()
-                        break
-                    except Exception as e:
-                        logging.error("exception reporting canonical post: {}".format(e))
+                report_text = "{} submission from /u/{}".format(report_type, submission.author)
         except Exception as e:
             logging.error("exception creating canonical post: {}".format(e))
 
         if post:
             reply = ("Thank you for your submission! We have created a new"
                      " [entry for this account]({}).".format(post.permalink))
-            process_contribution(submission, "accepted", note="for {}".format(name), reply=reply, crosspost=post)
+            note_posts = process_contribution(submission, "accepted", note="for {}".format(name), reply=reply, crosspost=post)
+            if report_text and note_posts:
+                report_text += " (" + ", ".join(sorted(map(lambda x: f"https://redd.it/{x.id}", note_posts))) + ")"
+            for attempt in range(3):
+                try:
+                    post.report(report_text)
+                    if report_type != "Reviewable":
+                        sync_submission(post)
+                        post.mod.approve()
+                    break
+                except Exception as e:
+                    logging.error("exception reporting canonical post: {}".format(e))
         elif canonical:
             reply = ("Thank you for your submission! It looks like we already have"
                      " an [entry for this account]({}).".format(canonical.permalink))
@@ -776,7 +823,7 @@ def check_notes():
     global NOTE_LIMIT
 
     logging.info("checking for notes")
-    if not MULTIREDDITS.get("notes"):
+    if not SUBREDDITS.get("notes"):
         return
 
     # process oldest comments first
@@ -843,7 +890,7 @@ def check_notes():
             for post in set(canonical.duplicates()):
                 if post.author != ME:
                     continue
-                if str(post.subreddit) not in MULTIREDDITS.get("notes", set()):
+                if not member("notes", post.subreddit):
                     continue
                 if post == comment.submission:
                     unlock = True
@@ -871,9 +918,57 @@ def check_notes():
         logging.info("skipped due to recent failure: {}".format(", ".join(sorted(skipped))))
 
 
+def find_duplicates(thread):
+    logging.info("finding duplicates due to command in {}".format(thread.id))
+    result = ""
+    try:
+        # find duplicates
+        urls = {}
+        for post in HOME.new(limit=1000):
+            if post.author == ME and post.url and post.url.startswith("https://www.reddit.com/user/"):
+                urls[post.url] = set.union(urls.get(post.url, set()), set([post.fullname]))
+        references = None
+        for url, fullnames in urls.items():
+            if len(fullnames) == 1:
+                continue
+            item = "multiple canonical posts for {} ({})".format(url, ", ".join(sorted(fullnames)))
+            logging.warning(item)
+            result += f"- {item}\n"
+            # count recent references to canonical posts
+            if references is None:
+                references = {}
+                for comment in r.redditor(ME).comments.new(limit=1000):
+                    for match in re.findall(f'/r/{HOME}/comments/\w+/\w+/', comment.body):
+                        references[match] = set.union(references.get(match, set()), set([comment.id]))
+            # score each canonical post
+            posts = sorted(r.info(fullnames=fullnames), key=lambda x: int(x.id, 36), reverse=True)
+            scores = {}
+            for post in posts:
+                first = 1 if not scores else 0
+                scores[post.fullname] = 10 * abs(post.num_reports) + len(references.get(post.permalink, set())) + first / 10
+            keep = sorted(fullnames, key=lambda x: scores.get(x, 0), reverse=True)[0]
+            if keep:
+                for post in posts:
+                    keep_string = "keeping" if keep == post.fullname else "removing"
+                    subitem = "{} duplicate {} for {}".format(keep_string, post.permalink, post.url)
+                    logging.info(subitem)
+                    result += f"  - {subitem}\n"
+                    if keep != post.fullname:
+                        post.mod.remove()
+        # reply
+        thread.reply(body=f"Command executed with no exceptions.\n\n{result}")
+    except Exception as e:
+        logging.error("exception checking for duplicate posts: {}".format(e))
+        try:
+            thread.reply(body=f"Command executed with an exception.\n\n{result}")
+        except Exception as e:
+            logging.error("exception creating exception note on {}: {}".format(thread, e))
+
+
 def check_mail():
     logging.info("checking mail")
     try:
+        # private messages
         for message in r.inbox.unread(limit=10):
             # log everything in inbox
             message_data = ["message {}".format(message.fullname)]
@@ -949,15 +1044,21 @@ def check_mail():
                             " activity. If you believe this was sent in error, please message /r/{}.".format(HOME)
                         )
             # looks like a removal
-            elif re.search("^/?u/[\w-]+ has been removed as a moderator from /?(r|u|user)/[\w-]+$", str(message.subject)):
+            elif re.search("^/?u/[\w-]+ has been removed as a moderator from /?(r|u|user)/[\w:-]+$", str(message.subject)):
                 message.mark_read()
                 load_subreddits()
                 schedule(load_subreddits, when="defer")
-                if str(subreddit) not in SUBREDDIT_LIST:
+                if not member("moderated", subreddit):
                     logging.info("removed as moderator from /r/{}".format(subreddit))
             # some other type of subreddit message
             else:
                 message.mark_read()
+        # internal commands
+        for thread in HOME.modmail.conversations(state="mod", limit=10):
+            if thread.owner == HOME and thread.is_internal and thread.num_messages == 1 and thread.is_highlighted:
+                thread.unhighlight()
+                if "!duplicates" in thread.subject:
+                    find_duplicates(thread)
     except Exception as e:
         logging.error("exception checking mail: {}".format(e))
 
@@ -1008,7 +1109,7 @@ def check_modmail():
                     for report, moderator in mod_reports:
                         if moderator == ME:
                             contributor = ""
-                            m = re.search("\\bsubmission from (/u/[\w-]{3,20})", report)
+                            m = re.search("\\bsubmission (?:\S+ )?from (/u/[\w-]{3,20})", report)
                             if m:
                                 contributor = "from {} ".format(m.group(1))
                             created = absolute_time(canonical.created_utc)
@@ -1018,7 +1119,7 @@ def check_modmail():
                     for post in set(canonical.duplicates()):
                         if post.author != ME:
                             continue
-                        if str(post.subreddit) not in MULTIREDDITS.get("notes", set()):
+                        if not member("notes", post.subreddit):
                             continue
                         authors = set()
                         for comment in post.comments.list():
@@ -1067,15 +1168,13 @@ def check_modmail():
 
 
 def join_subreddit(subreddit):
-    global SUBREDDIT_LIST
-
     try:
         if subreddit.quarantine:
             return False, "quarantined"
         elif subreddit.subreddit_type not in ["public", "restricted", "gold_only", "user"]:
             return False, subreddit.subreddit_type
-        elif str(subreddit) in MULTIREDDITS.get("prohibited", set()):
-            HOME.message("Invitation from prohibited subreddit", "/r/{}".format(subreddit))
+        elif member("prohibited", subreddit):
+            HOME.message(subject="Invitation from prohibited subreddit", message="/r/{}".format(subreddit))
             return False, "prohibited"
     except prawcore.exceptions.Forbidden:
         return False, "quarantined"
@@ -1087,9 +1186,9 @@ def join_subreddit(subreddit):
 
     try:
         subreddit.mod.accept_invite()
-        SUBREDDIT_LIST.add(str(subreddit))
-        if str(subreddit) in MULTIREDDITS.get("restricted", set()):
-            HOME.message("Joined restricted subreddit", "/r/{}".format(subreddit))
+        SUBREDDITS["moderated"].add(str(subreddit))
+        if member("restricted", subreddit):
+            HOME.message(subject="Joined restricted subreddit", message="/r/{}".format(subreddit))
     except Exception as e:
         if e.items[0].error_type == "NO_INVITE_FOUND" and subreddit.moderator(ME):
             return False, "moderator"
@@ -1198,7 +1297,7 @@ def sync_submission(submission):
                 logging.info("added inactive /u/{}".format(user))
             except Exception as e:
                 logging.error("error adding inactive /u/{}: {}".format(user, e))
-                HOME.message("Error adding inactive", "/u/{}".format(user))
+                HOME.message(subject="Error adding inactive", message="/u/{}".format(user))
             return
         # neither banned nor inactive
         elif user in FRIEND_LIST or user in INACTIVE_LIST:
@@ -1208,20 +1307,20 @@ def sync_submission(submission):
                     logging.info("removed friend /u/{}".format(user))
             except Exception as e:
                 logging.error("error removing friend /u/{}: {}".format(user, e))
-                HOME.message("Error removing friend", "/u/{}".format(user))
+                HOME.message(subject="Error removing friend", message="/u/{}".format(user))
             try:
                 if user in INACTIVE_LIST:
                     remove_inactive(user)
                     logging.info("removed inactive /u/{}".format(user))
             except Exception as e:
                 logging.error("error removing inactive /u/{}: {}".format(user, e))
-                HOME.message("Error removing inactive", "/u/{}".format(user))
+                HOME.message(subject="Error removing inactive", message="/u/{}".format(user))
             try:
                 if submission.link_flair_text in ["declined", "organic", "service"]:
                     HOME.flair.set(user, css_class="unban")
             except Exception as e:
                 logging.error("error adding unban /u/{}: {}".format(user, e))
-                HOME.message("Error adding unban", "/u/{}".format(user))
+                HOME.message(subject="Error adding unban", message="/u/{}".format(user))
 
 
 def check_unbans():
