@@ -616,7 +616,7 @@ def process_contribution(submission, result, note=None, reply=None, crosspost=No
                     canonicals.add(post.permalink)
             if len(canonicals) > 1:
                 logging.error("multiple canonical posts: {}".format(", ".join(sorted(canonicals))))
-                HOME.message(subject="Multiple canonical posts", message="\n\n".join(sorted(canonicals)))
+                schedule(check_duplicates, when="next")
             # make any crossposts
             for subreddit in SUBREDDITS.get("crossposts", set()):
                 available = False
@@ -918,9 +918,8 @@ def check_notes():
         logging.info("skipped due to recent failure: {}".format(", ".join(sorted(skipped))))
 
 
-def find_duplicates(thread):
-    logging.info("finding duplicates due to command in {}".format(thread.id))
-    result = ""
+def check_duplicates():
+    logging.info("checking for duplicates")
     try:
         # find duplicates
         urls = {}
@@ -934,7 +933,6 @@ def find_duplicates(thread):
                 continue
             item = "multiple canonical posts for {} ({})".format(url, ", ".join(sorted(fullnames)))
             logging.warning(item)
-            result += f"- {item}\n"
             # count recent references to canonical posts
             if references is None:
                 references = {}
@@ -953,17 +951,10 @@ def find_duplicates(thread):
                     keep_string = "keeping" if keep == post.fullname else "removing"
                     subitem = "{} duplicate {} for {}".format(keep_string, post.permalink, post.url)
                     logging.info(subitem)
-                    result += f"  - {subitem}\n"
                     if keep != post.fullname:
                         post.mod.remove()
-        # reply
-        thread.reply(body=f"Command executed with no exceptions.\n\n{result}")
     except Exception as e:
         logging.error("exception checking for duplicate posts: {}".format(e))
-        try:
-            thread.reply(body=f"Command executed with an exception.\n\n{result}")
-        except Exception as e:
-            logging.error("exception creating exception note on {}: {}".format(thread, e))
 
 
 def check_mail():
@@ -1054,12 +1045,6 @@ def check_mail():
             # some other type of subreddit message
             else:
                 message.mark_read()
-        # internal commands
-        for thread in HOME.modmail.conversations(state="mod", limit=10):
-            if thread.owner == HOME and thread.is_internal:
-                if "!duplicates" in thread.subject and thread.is_highlighted:
-                    thread.unhighlight()
-                    find_duplicates(thread)
     except Exception as e:
         logging.error("exception checking mail: {}".format(e))
 
@@ -1348,6 +1333,7 @@ if __name__ == "__main__":
     SCHEDULE = {
         check_comments: 5,
         check_contributions: 60,
+        check_duplicates: 3600,
         check_mail: 120,
         check_modmail: 30,
         check_notes: 120,
