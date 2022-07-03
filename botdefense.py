@@ -924,9 +924,10 @@ def find_duplicates(thread):
     try:
         # find duplicates
         urls = {}
-        for post in HOME.new(limit=1000):
-            if post.author == ME and post.url and post.url.startswith("https://www.reddit.com/user/"):
-                urls[post.url] = set.union(urls.get(post.url, set()), set([post.fullname]))
+        for iterator in HOME.new(limit=1000), HOME.search(f'author:{ME}', limit=250, sort='new'):
+            for post in iterator:
+                if post.author == ME and post.url and post.url.startswith("https://www.reddit.com/user/"):
+                    urls[post.url] = set.union(urls.get(post.url, set()), set([post.fullname]))
         references = None
         for url, fullnames in urls.items():
             if len(fullnames) == 1:
@@ -1055,9 +1056,9 @@ def check_mail():
                 message.mark_read()
         # internal commands
         for thread in HOME.modmail.conversations(state="mod", limit=10):
-            if thread.owner == HOME and thread.is_internal and thread.num_messages == 1 and thread.is_highlighted:
-                thread.unhighlight()
-                if "!duplicates" in thread.subject:
+            if thread.owner == HOME and thread.is_internal:
+                if "!duplicates" in thread.subject and thread.is_highlighted:
+                    thread.unhighlight()
                     find_duplicates(thread)
     except Exception as e:
         logging.error("exception checking mail: {}".format(e))
