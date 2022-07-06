@@ -370,6 +370,13 @@ def check_queue():
                     logging.info("queue hit for /u/{} in /r/{} at {}".format(submission.author,
                                                                              submission.subreddit, link))
                     consider_action(submission, link)
+    except prawcore.exceptions.Forbidden as e:
+        # probably removed from a subreddit
+        logging.warning("exception checking queue: {}".format(e))
+        # schedule load_subreddits in case check_mail does not run it
+        schedule(load_subreddits, when="next")
+        check_mail()
+        schedule(check_mail, when="defer")
     except Exception as e:
         error = str(e)
         if error.startswith("<html>"):
