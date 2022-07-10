@@ -986,7 +986,15 @@ def check_mail():
             # handle non-subreddit messages
             if not message.subreddit:
                 message.mark_read()
-                if message.distinguished in ["admin", "gold-auto"]:
+                if message.distinguished == "admin":
+                    # added as moderator by admin
+                    if re.search("\\byou are a moderator\\b", str(message.subject), re.I):
+                        m = re.search("\\badded as a moderator to\W+?(/?(r|u|user)/[\w-]+)", str(message.body))
+                        if m:
+                            logging.info("added to {} by {}".format(m.group(1), message.author))
+                        schedule(load_subreddits, when="next")
+                    continue
+                if message.distinguished == "gold-auto":
                     continue
                 if message.author in ["[deleted]", "mod_mailer"]:
                     continue
