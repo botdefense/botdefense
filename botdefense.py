@@ -397,6 +397,9 @@ def consider_action(post, link):
     if activity in WHITELIST_CACHE:
         return False
 
+    if post.banned_by == ME:
+        return False
+
     logging.info("subreddit hit /u/{} in /r/{}".format(account, subreddit))
     permissions = []
     try:
