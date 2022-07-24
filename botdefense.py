@@ -991,7 +991,7 @@ def check_mail():
                     if re.search("\\byou are a moderator\\b", str(message.subject), re.I):
                         m = re.search("\\badded as a moderator to\W+?(/?(r|u|user)/[\w-]+)", str(message.body))
                         if m:
-                            logging.info("added to {} by {}".format(m.group(1), message.author))
+                            logging.info("added to {} by /u/{}".format(m.group(1), message.author))
                         schedule(load_subreddits, when="next")
                     continue
                 if message.distinguished == "gold-auto":
@@ -1188,8 +1188,13 @@ def join_subreddit(subreddit):
     try:
         subreddit.mod.accept_invite()
         SUBREDDITS["moderated"].add(str(subreddit))
-        if member("restricted", subreddit):
-            HOME.message(subject="Joined restricted subreddit", message="/r/{}".format(subreddit))
+        try:
+            if subreddit.over18:
+                SUBREDDITS["nsfw"].add(str(subreddit))
+            if member("restricted", subreddit):
+                HOME.message(subject="Joined restricted subreddit", message="/r/{}".format(subreddit))
+        except Exception as e:
+            logging.error("exception after joining /r/{}: {}".format(subreddit, e))
     except Exception as e:
         if e.items[0].error_type == "NO_INVITE_FOUND" and subreddit.moderator(ME):
             return False, "moderator"
