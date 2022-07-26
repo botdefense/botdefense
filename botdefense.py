@@ -1,12 +1,14 @@
 #!/usr/bin/env python3.7
 
-import os
-import sys
 import logging
-import re
-import time
-from datetime import datetime
+import os
 import random
+import re
+import sys
+import time
+from copy import deepcopy
+from datetime import datetime
+
 import praw
 import prawcore.exceptions
 import yaml
@@ -29,6 +31,7 @@ MODMAIL_IDS = []
 UNBAN_STATE = {}
 OPTIONS_DEFAULT = { "modmail_mute": True, "modmail_notes": False }
 OPTIONS_DISABLED = { "modmail_mute": False, "modmail_notes": False }
+CONFIGURATION = {}
 CONFIGURATION_DEFAULT = {
     "ban_message": ("Bots and bot-like accounts are not welcome on /r/{subreddit}.\n\n"
                     "[I am a bot, and this action was performed automatically]"
@@ -251,7 +254,7 @@ def load_configuration(subreddit=None):
         subreddit = HOME
     if member("restricted", subreddit):
         return OPTIONS_DISABLED
-    options = OPTIONS_DEFAULT
+    options = deepcopy(OPTIONS_DEFAULT)
     if subreddit == HOME:
         options.update(CONFIGURATION_DEFAULT)
     try:
