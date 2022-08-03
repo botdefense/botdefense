@@ -630,6 +630,13 @@ def process_contribution(submission, result, note=None, reply=None, crosspost=No
             if len(canonicals) > 1:
                 logging.error("multiple canonical posts: {}".format(", ".join(sorted(canonicals))))
                 schedule(check_duplicates, when="next")
+                try:
+                    for post in [crosspost] + list(duplicates):
+                        if post.permalink in canonicals:
+                            logging.info("saving duplicate {}".format(post.permalink))
+                            post.save()
+                except Exception as e:
+                    logging.error("exception saving duplicates: {}".format(e))
             # make any crossposts
             for subreddit in SUBREDDITS.get("crossposts", set()):
                 available = False
@@ -936,10 +943,12 @@ def check_duplicates():
     try:
         # find duplicates
         urls = {}
-        for iterator in HOME.new(limit=1000), HOME.search(f'author:{ME}', limit=250, sort='new'):
+        for iterator in HOME.new(limit=1000), HOME.search(f'author:{ME}', limit=250, sort='new'), r.user.me().saved(limit=1000):
             for post in iterator:
                 if post.author == ME and post.url and post.url.startswith("https://www.reddit.com/user/"):
                     urls[post.url] = set.union(urls.get(post.url, set()), set([post.fullname]))
+                if post.saved:
+                    post.unsave()
         references = None
         for url, fullnames in urls.items():
             if len(fullnames) == 1:
