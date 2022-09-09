@@ -28,6 +28,7 @@ NOTE_LIMIT = 0
 WHITELIST_CACHE = {}
 SUBMISSION_IDS = []
 MODMAIL_IDS = []
+NEW_FRIENDS = []
 UNBAN_STATE = {}
 OPTIONS_DEFAULT = { "modmail_mute": True, "modmail_notes": False }
 OPTIONS_DISABLED = { "modmail_mute": False, "modmail_notes": False }
@@ -319,7 +320,7 @@ def check_comments():
                     continue
                 if comment.created_utc <= time.time() - 3600:
                     break
-                link = "https://www.reddit.com/comments/{}/_/{}".format(comment.submission.id, comment.id)
+                link = "https://www.reddit.com/comments/{}/_/{}".format(comment.link_id[3:], comment.id)
                 consider_action(comment, link)
                 # we only cache identifiers after processing successfully
                 COMMENT_CACHE[str(comment.id)] = comment.created_utc
@@ -387,7 +388,54 @@ def check_queue():
         logging.error("exception checking queue: {}".format(error))
 
 
-def consider_action(post, link):
+def check_accounts():
+    logging.info("checking accounts")
+    recent_activity = option(HOME, "recent_activity")
+    if not isinstance(recent_activity, list) or not all(x and isinstance(x, dict) for x in recent_activity):
+        return
+    pause = time.time() + 60
+    while NEW_FRIENDS and time.time() < pause:
+        user = NEW_FRIENDS.pop(0)
+        logging.info("scanning /u/{}".format(user))
+        try:
+            activity = 0
+            posts = []
+            for post in user.new(limit=100):
+                activity += 1
+                if member("moderated", post.subreddit) and post.created_utc > time.time() - 86400:
+                    posts.append(post)
+            age = (time.time() - user.created_utc) / 86400
+            for post in posts:
+                elapsed = int(time.time() - post.created_utc)
+                hits = set()
+                if post.fullname.startswith("t1_"):
+                    post_type = "comment"
+                elif post.fullname.startswith("t3_"):
+                    post_type = "submission"
+                else:
+                    continue
+                for limit in recent_activity:
+                    matched = 0
+                    matched += bool(limit.get("activity") and activity <= limit["activity"])
+                    matched += bool(limit.get("age") and age <= limit["age"])
+                    matched += bool(limit.get("elapsed") and elapsed <= limit["elapsed"])
+                    matched += bool(limit.get("type") and post_type == limit["type"])
+                    matched += bool(limit.get("banuser"))
+                    if limit and matched == len(limit):
+                        hits.add("banuser" if limit.get("banuser") else "remove")
+                if hits:
+                    if post_type == "comment":
+                        link = "https://www.reddit.com/comments/{}/_/{}".format(post.link_id[3:], post.id)
+                    else:
+                        link = "https://www.reddit.com/comments/{}".format(post.id)
+                    logging.info("recent hit for /u/{} in /r/{} at {} (activity {}, age {:.2f}, elapsed {})"
+                                 .format(post.author, post.subreddit, link, activity, age, elapsed))
+                    consider_action(post, link, banuser=("banuser" in hits))
+        except Exception as e:
+            logging.warning("exception checking account /u/{}: {}".format(user, e))
+
+
+def consider_action(post, link, banuser=True):
     global WHITELIST_CACHE
 
     account = post.author
@@ -447,7 +495,7 @@ def consider_action(post, link):
         logging.error("error checking moderator list, failing safe for /u/{} in /r/{}: {}".format(account, subreddit, e))
         return False
 
-    if "access" in permissions or "all" in permissions:
+    if banuser and ("access" in permissions or "all" in permissions):
         ban(account, subreddit, link, ("mail" in permissions))
 
     if getattr(post, "removed", None) or getattr(post, "spam", None):
@@ -490,6 +538,7 @@ def add_friend(user):
     user.friend()
     r.user.me().subreddit.flair.set(user, text="banned", css_class="banned")
     FRIEND_LIST.add(user)
+    NEW_FRIENDS.append(user)
     if user in INACTIVE_LIST:
         INACTIVE_LIST.remove(user)
 
@@ -674,6 +723,7 @@ def check_contributions():
 
     # process oldest submissions first
     submissions = []
+    moderators = []
     try:
         # check submissions
         newest = None
@@ -683,7 +733,12 @@ def check_contributions():
             if submission.created_utc < CONTRIBUTION_LIMIT or submission.created_utc < time.time() - 86400:
                 break
             if submission.author != ME:
-                submissions.insert(0, submission)
+                # fetch moderator list once
+                if not moderators:
+                    moderators = list(map(str, HOME.moderator()))
+                # allow time for submission statement
+                if submission.author in moderators or submission.created_utc < time.time() - 60 or (submission.num_comments and len(submission.comments)):
+                    submissions.insert(0, submission)
         # set future limit
         if submissions:
             CONTRIBUTION_LIMIT = submissions[0].created_utc - 600
@@ -694,7 +749,6 @@ def check_contributions():
 
     # process submissions for a limited period of time
     pause = time.time() + 60
-    moderators = None
     for submission in submissions:
         if time.time() >= pause:
             break
@@ -713,10 +767,6 @@ def check_contributions():
                 account = m.group(1)
         if not account:
             continue
-
-        # fetch moderator list once
-        if moderators is None:
-            moderators = list(map(str, HOME.moderator()))
 
         # set flair if AutoModerator failed
         try:
@@ -793,8 +843,15 @@ def check_contributions():
                 if submission.link_flair_text:
                     m = re.search("^contribution-(\w+)$", submission.link_flair_text)
                     if m:
-                        css_class = m.group(1)
-                        report_type = css_class.capitalize()
+                        # assign flair for moderators and flaired users providing a submission statement
+                        assign_flair = submission.author in moderators
+                        if not assign_flair and submission.num_comments and len(submission.comments) and submission.comments[0].author == submission.author:
+                            user_flair = next(submission.subreddit.flair(submission.author))
+                            if user_flair.get("user") == submission.author and user_flair.get("flair_css_class"):
+                                assign_flair = True
+                        if assign_flair:
+                            css_class = m.group(1)
+                            report_type = css_class.capitalize()
                 flair = None
                 try:
                     for template in HOME.flair.link_templates:
@@ -996,6 +1053,7 @@ def check_mail():
 
             # skip non-messages
             if not message.fullname.startswith("t4_"):
+                message.mark_read()
                 continue
 
             # handle non-subreddit messages
@@ -1366,6 +1424,7 @@ def check_unbans():
 
 if __name__ == "__main__":
     SCHEDULE = {
+        check_accounts: 120,
         check_comments: 5,
         check_contributions: 60,
         check_duplicates: 3600,
