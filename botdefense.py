@@ -24,12 +24,13 @@ COMMENT_CACHE = {}
 LOG_CACHE = {}
 CONTRIBUTION_LIMIT = 0
 NOTE_FAILURE_CACHE = {}
-NOTE_LIMIT = 0
+NOTE_UNLOCKED_CACHE = {}
 WHITELIST_CACHE = {}
 SUBMISSION_IDS = []
 MODMAIL_IDS = []
 NEW_FRIENDS = []
 UNBAN_STATE = {}
+ACCOUNT_URL_REGEX = r'^https?://(?:\w+\.)?reddit\.com/u(?:ser)?/([\w-]{3,20})'
 OPTIONS_DEFAULT = { "modmail_mute": True, "modmail_notes": False }
 OPTIONS_DISABLED = { "modmail_mute": False, "modmail_notes": False }
 CONFIGURATION = {}
@@ -624,20 +625,23 @@ def unban(account, subreddit):
         logging.warning("error checking ban for /u/{} in /r/{}: {}".format(account, subreddit, e))
 
 
-def find_canonical(name):
+def find_canonical(name, subreddit=None):
     title = "overview for " + name
     url = "https://www.reddit.com/user/" + name
 
+    if not subreddit:
+        subreddit = HOME
+
     try:
         for post in r.info(url=url):
-            if post.title.lower() == title.lower() and post.author == ME and post.subreddit == HOME and not post.removed_by_category:
+            if post.title.lower() == title.lower() and post.author == ME and post.subreddit == subreddit and not post.removed_by_category:
                 logging.info("using info result for {}".format(name))
                 return post
     except Exception as e:
         logging.error("exception querying for canonical post: {}".format(e))
 
     try:
-        for post in HOME.search(f'title:"{name}"', limit=250):
+        for post in subreddit.search(f'title:"{name}"', limit=250):
             if post.title.lower() == title.lower() and post.author == ME:
                 logging.info("using search result for {}".format(name))
                 return post
@@ -645,7 +649,7 @@ def find_canonical(name):
         logging.error("exception searching for canonical post: {}".format(e))
 
     try:
-        for post in HOME.new(limit=100):
+        for post in subreddit.new(limit=100):
             if post.title.lower() == title.lower() and post.author == ME:
                 logging.info("using new result for {}".format(name))
                 return post
@@ -657,7 +661,9 @@ def find_canonical(name):
 
 
 def process_contribution(submission, result, note=None, reply=None, crosspost=None):
-    note_posts = set()
+    global NOTE_FAILURE_CACHE
+
+    note_post = None
     try:
         submission.mod.remove()
     except Exception as e:
@@ -686,24 +692,28 @@ def process_contribution(submission, result, note=None, reply=None, crosspost=No
                             post.save()
                 except Exception as e:
                     logging.error("exception saving duplicates: {}".format(e))
-            # make any crossposts
-            for subreddit in SUBREDDITS.get("crossposts", set()):
-                available = False
+            # make notes crosspost if needed
+            notes = option(HOME, "notes")
+            if notes:
+                subreddit = r.subreddit(notes)
+                # see if a notes post already exists
                 for post in duplicates:
                     if post.subreddit == subreddit and not post.removed_by_category and not post.archived and post.title == crosspost.title and post.author == ME:
-                        available = True
-                        if member("notes", post.subreddit):
-                            note_posts.add(post)
-                        break
-                if not available:
+                        note_post = post
+                if not note_post:
                     new = None
                     # submissions from private subreddits cannot be crossposted
                     if crosspost.subreddit.subreddit_type == "private":
-                        new = r.subreddit(subreddit).submit(crosspost.title, url=submission.url, send_replies=False)
+                        new = subreddit.submit(crosspost.title, url=submission.url, send_replies=False)
                     else:
                         new = crosspost.crosspost(subreddit, send_replies=False)
-                    if new and member("notes", new.subreddit):
-                        note_posts.add(new)
+                    if new:
+                        m = re.search(ACCOUNT_URL_REGEX, crosspost.url)
+                        if m:
+                            account = m.group(1)
+                            if account in NOTE_FAILURE_CACHE:
+                                del NOTE_FAILURE_CACHE[account]
+                        note_post = new
     except Exception as e:
         logging.warning("exception crossposting {}: {}".format(crosspost.permalink, e))
     note = " " + note if note else ""
@@ -713,7 +723,7 @@ def process_contribution(submission, result, note=None, reply=None, crosspost=No
         HOME.message(subject="Error processing contribution", message="{}".format(submission.permalink))
     else:
         logging.info(log)
-    return note_posts
+    return note_post
 
 
 def check_contributions():
@@ -762,7 +772,7 @@ def check_contributions():
         # require account
         account = None
         if submission.url:
-            m = re.search("^https?://(?:\w+\.)?reddit\.com/u(?:ser)?/([\w-]{3,20})", submission.url)
+            m = re.search(ACCOUNT_URL_REGEX, submission.url)
             if m:
                 account = m.group(1)
         if not account:
@@ -870,9 +880,9 @@ def check_contributions():
         if post:
             reply = ("Thank you for your submission! We have created a new"
                      " [entry for this account]({}).".format(post.permalink))
-            note_posts = process_contribution(submission, "accepted", note="for {}".format(name), reply=reply, crosspost=post)
-            if report_text and note_posts:
-                report_text += " (" + ", ".join(sorted(map(lambda x: f"https://redd.it/{x.id}", note_posts))) + ")"
+            note_post = process_contribution(submission, "accepted", note="for {}".format(name), reply=reply, crosspost=post)
+            if report_text and note_post:
+                report_text += f" (https://redd.it/{note_post.id})"
             for attempt in range(3):
                 try:
                     post.report(report_text)
@@ -897,97 +907,118 @@ def check_contributions():
 
 def check_notes():
     global NOTE_FAILURE_CACHE
-    global NOTE_LIMIT
+    global NOTE_UNLOCKED_CACHE
 
     logging.info("checking for notes")
-    if not SUBREDDITS.get("notes"):
+    notes = option(HOME, "notes")
+    if not notes:
         return
 
-    # process oldest comments first
+    # find locked comments
+    locked = {}
     comments = []
     try:
-        # check comments
-        newest = None
-        for comment in r.multireddit(redditor=ME, name="contributions").comments(limit=1000):
-            if newest is None:
-                newest = comment
-            if comment.created_utc < NOTE_LIMIT or comment.created_utc < time.time() - 28800:
+        for log in r.get(path=f"/user/{ME}/m/contributions/about/log/", params={"limit": 500, "type": "lock"}):
+            if log.created_utc < time.time() - 28800:
                 break
-            if comment.locked and comment.author != ME:
+            if log.created_utc > time.time() - 120 or log.target_author == ME:
+                continue
+            if not log.target_fullname or not log.target_fullname.startswith("t1_"):
+                continue
+            # comments to process
+            if log.created_utc > NOTE_UNLOCKED_CACHE.get(log.target_fullname, 0):
+                locked[log.target_fullname] = max(log.created_utc, locked.get(log.target_fullname, 0))
+        for comment in r.info(fullnames=locked.keys()):
+            if comment.locked:
+                # unlock old comments
                 if comment.created_utc < time.time() - 21600:
                     logging.warning("unable to create note for {}".format(comment.permalink))
                     comment.mod.unlock()
+                    if comment.fullname in locked:
+                        NOTE_UNLOCKED_CACHE[comment.fullname] = locked[comment.fullname]
+                # process recent comments
                 else:
                     comments.insert(0, comment)
-        # set future limit
-        if comments:
-            NOTE_LIMIT = comments[0].created_utc - 600
-        elif newest:
-            NOTE_LIMIT = newest.created_utc - 3600
+            elif comment.fullname in locked:
+                NOTE_UNLOCKED_CACHE[comment.fullname] = locked[comment.fullname]
+        if locked or comments:
+            logging.info(f"{len(locked)} locked targets, {len(comments)} locked comments")
+        if not comments:
+            return
     except Exception as e:
         logging.error("exception checking comments: {}".format(e))
+
+    # populate submissions
+    try:
+        submissions = {}
+        for info in r.info(fullnames=set(map(lambda x: x.link_id, comments))):
+            submissions[info.fullname] = info
+        for comment in comments:
+            if submissions.get(comment.link_id):
+                comment.submission = submissions[comment.link_id]
+    except Exception as e:
+        logging.error("exception populating submissions: {}".format(e))
 
     # process comments for a limited period of time
     pause = time.time() + 60
     skipped = set()
-    for comment in comments:
+    # process oldest comments first
+    for comment in sorted(comments, key=lambda x: int(x.id, 36)):
         if time.time() >= pause:
             break
-
-        # skip new comments
-        if comment.created_utc > time.time() - 120:
-            continue
 
         try:
             account = None
             if comment.submission.url:
-                m = re.search("^https?://(?:\w+\.)?reddit\.com/u(?:ser)?/([\w-]{3,20})", comment.submission.url)
+                m = re.search(ACCOUNT_URL_REGEX, comment.submission.url)
                 if m:
                     account = m.group(1)
             if not account:
                 comment.mod.unlock()
+                if comment.fullname in locked:
+                    NOTE_UNLOCKED_CACHE[comment.fullname] = locked[comment.fullname]
+                continue
+
+            # comment made directly on notes post
+            if comment.submission.author == ME and comment.subreddit == notes and not comment.submission.removed_by_category:
+                comment.mod.unlock()
+                if comment.fullname in locked:
+                    NOTE_UNLOCKED_CACHE[comment.fullname] = locked[comment.fullname]
                 continue
 
             # skip recent failures
-            if NOTE_FAILURE_CACHE.get(account):
+            if account in NOTE_FAILURE_CACHE:
                 skipped.add(comment.id)
                 continue
 
-            canonical = None
-            if comment.subreddit == HOME and comment.submission.author == ME:
-                canonical = comment.submission
-            else:
-                canonical = find_canonical(account)
-            if not canonical:
+            # find notes post
+            post = find_canonical(account, subreddit=r.subreddit(notes))
+
+            # skip comment if missing
+            if not post:
                 NOTE_FAILURE_CACHE[account] = time.time()
-                logging.warning("unable to find canonical post for {}".format(comment.permalink))
+                logging.warning("unable to find notes post for {}".format(comment.permalink))
                 continue
 
-            unlock = False
-            for post in set(canonical.duplicates()):
-                if post.author != ME:
-                    continue
-                if not member("notes", post.subreddit):
-                    continue
-                if post == comment.submission:
-                    unlock = True
-                    continue
-                attribution = "Note from /u/{} at {}".format(comment.author, comment.permalink)
-                logging.info("creating note for {} on {}".format(comment.permalink, post.permalink))
+            # process note
+            attribution = "Note from /u/{} at {}".format(comment.author, comment.permalink)
+            logging.info("creating note for {} on {}".format(comment.permalink, post.permalink))
+            try:
+                post.reply(body="{}:\n\n---\n\n{}".format(attribution, comment.body))
+                comment.mod.unlock()
+                if comment.fullname in locked:
+                    NOTE_UNLOCKED_CACHE[comment.fullname] = locked[comment.fullname]
+            except praw.exceptions.RedditAPIException as e:
+                logging.warning("exception creating note for {}, trying again with short note: {}".format(comment.permalink, e))
                 try:
-                    post.reply(body="{}:\n\n---\n\n{}".format(attribution, comment.body))
-                    unlock = True
-                except praw.exceptions.RedditAPIException as e:
-                    logging.warning("exception creating note for {}, trying again with short note: {}".format(comment.permalink, e))
-                    try:
-                        post.reply(body="{}.".format(attribution))
-                        unlock = True
-                    except Exception as e:
-                        logging.error("exception creating note for {}: {}".format(comment.permalink, e))
+                    post.reply(body="{}.".format(attribution))
+                    comment.mod.unlock()
+                    if comment.fullname in locked:
+                        NOTE_UNLOCKED_CACHE[comment.fullname] = locked[comment.fullname]
                 except Exception as e:
                     logging.error("exception creating note for {}: {}".format(comment.permalink, e))
-            if unlock:
-                comment.mod.unlock()
+            except Exception as e:
+                logging.error("exception creating note for {}: {}".format(comment.permalink, e))
         except Exception as e:
             logging.error("exception checking for notes: {}".format(e))
 
@@ -1193,7 +1224,7 @@ def check_modmail():
                     for post in set(canonical.duplicates()):
                         if post.author != ME:
                             continue
-                        if not member("notes", post.subreddit):
+                        if post.subreddit != option(HOME, "notes"):
                             continue
                         authors = set()
                         for comment in post.comments.list():
@@ -1280,6 +1311,8 @@ def join_subreddit(subreddit):
 def check_state():
     global COMMENT_CACHE
     global LOG_CACHE
+    global NOTE_FAILURE_CACHE
+    global NOTE_UNLOCKED_CACHE
     global WHITELIST_CACHE
 
     logging.info("checking state")
@@ -1334,6 +1367,7 @@ def check_state():
     expire_cache(COMMENT_CACHE, 3600)
     expire_cache(LOG_CACHE, 86400)
     expire_cache(NOTE_FAILURE_CACHE, 3600)
+    expire_cache(NOTE_UNLOCKED_CACHE, 28800)
     expire_cache(WHITELIST_CACHE, 3600)
 
 
