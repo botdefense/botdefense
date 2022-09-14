@@ -30,7 +30,6 @@ SUBMISSION_IDS = []
 MODMAIL_IDS = []
 NEW_FRIENDS = []
 UNBAN_STATE = {}
-ACCOUNT_URL_REGEX = r'^https?://(?:\w+\.)?reddit\.com/u(?:ser)?/([\w-]{3,20})'
 OPTIONS_DEFAULT = { "modmail_mute": True, "modmail_notes": False }
 OPTIONS_DISABLED = { "modmail_mute": False, "modmail_notes": False }
 CONFIGURATION = {}
@@ -660,6 +659,13 @@ def find_canonical(name, subreddit=None):
     return None
 
 
+def account_name(submission):
+    m = re.search(r'^https?://(?:\w+\.)?reddit\.com/u(?:ser)?/([\w-]{3,20})', str(submission.url))
+    if m:
+        return m.group(1)
+    return None
+
+
 def process_contribution(submission, result, note=None, reply=None, crosspost=None):
     global NOTE_FAILURE_CACHE
 
@@ -708,11 +714,9 @@ def process_contribution(submission, result, note=None, reply=None, crosspost=No
                     else:
                         new = crosspost.crosspost(subreddit, send_replies=False)
                     if new:
-                        m = re.search(ACCOUNT_URL_REGEX, crosspost.url)
-                        if m:
-                            account = m.group(1)
-                            if account in NOTE_FAILURE_CACHE:
-                                del NOTE_FAILURE_CACHE[account]
+                        account = account_name(crosspost)
+                        if account in NOTE_FAILURE_CACHE:
+                            del NOTE_FAILURE_CACHE[account]
                         note_post = new
     except Exception as e:
         logging.warning("exception crossposting {}: {}".format(crosspost.permalink, e))
@@ -757,6 +761,9 @@ def check_contributions():
     except Exception as e:
         logging.error("exception checking submissions: {}".format(e))
 
+    # fetch templates once
+    templates = None
+
     # process submissions for a limited period of time
     pause = time.time() + 60
     for submission in submissions:
@@ -770,11 +777,7 @@ def check_contributions():
                 continue
 
         # require account
-        account = None
-        if submission.url:
-            m = re.search(ACCOUNT_URL_REGEX, submission.url)
-            if m:
-                account = m.group(1)
+        account = account_name(submission)
         if not account:
             continue
 
@@ -782,7 +785,9 @@ def check_contributions():
         try:
             if not submission.link_flair_text and submission.created_utc < time.time() - 600:
                 flair = None
-                for template in HOME.flair.link_templates:
+                if templates is None:
+                    templates = list(HOME.flair.link_templates)
+                for template in templates:
                     if template.get("css_class") == "contribution":
                         flair = template.get("id")
                         break
@@ -799,12 +804,19 @@ def check_contributions():
         if not (submission.link_flair_text or submission.author in moderators or submission.subreddit.subreddit_type == "private"):
             continue
 
+        blocked = None
         name = None
         try:
-            user = r.get(path=f"/user/{account}/about/")
+            user = r.redditor(account)
+            if getattr(user, "is_employee", None):
+                blocked = ("admin", "an admin", "an admin")
+            elif user in moderators:
+                blocked = ("moderator", "a moderator", "a moderator")
+            elif user == submission.author:
+                blocked = ("submitter", "your own", "their own")
             name = user.name
         except Exception as e:
-            logging.debug("exception checking account {}: ".format(account, e))
+            logging.debug("exception checking account {}: {}".format(account, e))
 
         if not name or getattr(user, "is_suspended", None):
             reply = ("Thank you for your submission! That account does not appear to exist"
@@ -813,27 +825,24 @@ def check_contributions():
             process_contribution(submission, "rejected", reply=reply)
             continue
 
-        if submission.author == user and submission.author not in moderators:
-            process_contribution(submission, "blocked", note="(submitter account)")
-            HOME.banned.add(submission.author, ban_message="Submitting your own account is not allowed.",
-                            note="submitted their own account {}".format(submission.permalink))
-            continue
-
-        if user in moderators and submission.author not in moderators:
-            process_contribution(submission, "blocked", note="(moderator account)")
-            HOME.banned.add(submission.author, ban_message="Submitting a moderator account is not allowed.",
-                            note="submitted moderator account {}".format(submission.permalink))
+        if blocked:
+            process_contribution(submission, "blocked", note=f"({blocked[0]} account)")
+            if submission.author not in moderators:
+                HOME.banned.add(submission.author,
+                                ban_message=f"Submitting {blocked[1]} account is not allowed.",
+                                note=f"submitted {blocked[2]} account {submission.permalink}")
             continue
 
         approved = True
         try:
-            for report_name in ["mod_reports", "mod_reports_dismissed"]:
-                value = getattr(submission, report_name, None)
-                if value:
-                    for report, moderator in value:
-                        if moderator == "AutoModerator":
-                            logging.info("contribution {} from /u/{} reported for \"{}\"".format(submission.permalink, submission.author, report))
-                            approved = False
+            if submission.num_reports:
+                for report_name in ["mod_reports", "mod_reports_dismissed"]:
+                    value = getattr(submission, report_name, None)
+                    if value:
+                        for report, moderator in value:
+                            if moderator == "AutoModerator":
+                                logging.info("contribution {} from /u/{} reported for \"{}\"".format(submission.permalink, submission.author, report))
+                                approved = False
             if not approved and submission.author.is_mod:
                 minimum = option(HOME, "contribution_minimum_subscribers")
                 if minimum:
@@ -864,7 +873,9 @@ def check_contributions():
                             report_type = css_class.capitalize()
                 flair = None
                 try:
-                    for template in HOME.flair.link_templates:
+                    if templates is None:
+                        templates = list(HOME.flair.link_templates)
+                    for template in templates:
                         if template.get("css_class") == css_class:
                             flair = template.get("id")
                             break
@@ -968,11 +979,7 @@ def check_notes():
             break
 
         try:
-            account = None
-            if comment.submission.url:
-                m = re.search(ACCOUNT_URL_REGEX, comment.submission.url)
-                if m:
-                    account = m.group(1)
+            account = account_name(comment.submission)
             if not account:
                 comment.mod.unlock()
                 if comment.fullname in locked:
