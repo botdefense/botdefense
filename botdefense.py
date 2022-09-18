@@ -26,7 +26,7 @@ CONTRIBUTION_LIMIT = 0
 NOTE_FAILURE_CACHE = {}
 NOTE_UNLOCKED_CACHE = {}
 WHITELIST_CACHE = {}
-SUBMISSION_IDS = []
+SUBMISSION_CACHE = {}
 MODMAIL_IDS = []
 NEW_FRIENDS = []
 UNBAN_STATE = {}
@@ -173,6 +173,14 @@ def relative_time(when):
     return str(int(delta / 3600)) + " hours ago"
 
 
+def short_link(post):
+    if post.fullname.startswith("t1_"):
+        return f"https://www.reddit.com/comments/{post.link_id[3:]}/_/{post.id}"
+    elif post.fullname.startswith("t3_"):
+        return f"https://www.reddit.com/comments/{post.id}"
+    return None
+
+
 def update_status():
     global STATUS_POST
 
@@ -314,16 +322,20 @@ def check_comments():
     logging.info("checking comments (after {}, cache {})".format(COMMENT_AFTER, len(COMMENT_CACHE)))
     comment = None
     try:
+        entries = {}
         for after in [None, COMMENT_AFTER] if COMMENT_AFTER else [None]:
             for comment in SCAN.comments(limit=100, params={"after": after}):
-                if str(comment.id) in COMMENT_CACHE:
+                if comment.id in COMMENT_CACHE:
                     continue
                 if comment.created_utc <= time.time() - 3600:
                     break
-                link = "https://www.reddit.com/comments/{}/_/{}".format(comment.link_id[3:], comment.id)
-                consider_action(comment, link)
-                # we only cache identifiers after processing successfully
-                COMMENT_CACHE[str(comment.id)] = comment.created_utc
+                if member("moderated", comment.subreddit):
+                    if comment.subreddit not in entries:
+                        entries[comment.subreddit] = []
+                    entries[comment.subreddit].append(comment)
+                    COMMENT_CACHE[comment.id] = comment.created_utc
+        for subreddit, comments in entries.items():
+            consider_action("check_comments", comments)
     except Exception as e:
         logging.error("exception checking comments: {}".format(e))
 
@@ -331,23 +343,20 @@ def check_comments():
 
 
 def check_submissions():
-    global SUBMISSION_IDS
+    global SUBMISSION_CACHE
 
     logging.info("checking submissions")
     try:
         for submission in SCAN.new(limit=100):
-            if str(submission.id) in SUBMISSION_IDS:
+            if submission.id in SUBMISSION_CACHE:
                 continue
-            link = "https://www.reddit.com/comments/{}".format(submission.id)
-            consider_action(submission, link)
-            # we only cache identifiers after processing successfully
-            SUBMISSION_IDS.append(str(submission.id))
+            if submission.created_utc <= time.time() - 3600:
+                break
+            if member("moderated", submission.subreddit):
+                consider_action("check_submissions", submission)
+                SUBMISSION_CACHE[submission.id] = submission.created_utc
     except Exception as e:
         logging.error("exception checking submissions: {}".format(e))
-
-    # trim cache
-    if len(SUBMISSION_IDS) > 200:
-        SUBMISSION_IDS = SUBMISSION_IDS[-200:]
 
 
 def check_queue():
@@ -370,10 +379,7 @@ def check_queue():
             limit = 5 if query in exclusions else 100
             for submission in r.subreddit(query).mod.modqueue(limit=limit, only="submissions"):
                 if submission.author in FRIEND_LIST:
-                    link = "https://www.reddit.com/comments/{}".format(submission.id)
-                    logging.info("queue hit for /u/{} in /r/{} at {}".format(submission.author,
-                                                                             submission.subreddit, link))
-                    consider_action(submission, link)
+                    consider_action("check_queue", submission)
     except prawcore.exceptions.Forbidden as e:
         # probably removed from a subreddit
         logging.warning("exception checking queue: {}".format(e))
@@ -393,6 +399,9 @@ def check_accounts():
     recent_activity = option(HOME, "recent_activity")
     if not isinstance(recent_activity, list) or not all(x and isinstance(x, dict) for x in recent_activity):
         return
+    recent_activity_limit = option(HOME, "recent_activity_limit", 86400)
+    if not isinstance(recent_activity_limit, int):
+        return
     pause = time.time() + 60
     while NEW_FRIENDS and time.time() < pause:
         user = NEW_FRIENDS.pop(0)
@@ -402,9 +411,13 @@ def check_accounts():
             posts = []
             for post in user.new(limit=100):
                 activity += 1
-                if member("moderated", post.subreddit) and post.created_utc > time.time() - 86400:
+                if member("moderated", post.subreddit) and post.created_utc > time.time() - recent_activity_limit:
                     posts.append(post)
+            if not posts:
+                continue
             age = (time.time() - user.created_utc) / 86400
+            ban = set()
+            entries = {}
             for post in posts:
                 elapsed = int(time.time() - post.created_utc)
                 hits = set()
@@ -422,24 +435,29 @@ def check_accounts():
                     matched += bool(limit.get("type") and post_type == limit["type"])
                     matched += bool(limit.get("banuser"))
                     if limit and matched == len(limit):
-                        hits.add("banuser" if limit.get("banuser") else "remove")
-                if hits:
-                    if post_type == "comment":
-                        link = "https://www.reddit.com/comments/{}/_/{}".format(post.link_id[3:], post.id)
-                    else:
-                        link = "https://www.reddit.com/comments/{}".format(post.id)
-                    logging.info("recent hit for /u/{} in /r/{} at {} (activity {}, age {:.2f}, elapsed {})"
-                                 .format(post.author, post.subreddit, link, activity, age, elapsed))
-                    consider_action(post, link, banuser=("banuser" in hits))
+                        if post.subreddit not in entries:
+                            entries[post.subreddit] = set()
+                        entries[post.subreddit].add(post)
+                        if limit.get("banuser"):
+                            ban.add(post.subreddit)
+            for subreddit, posts in entries.items():
+                consider_action("check_accounts", posts, banuser=(subreddit in ban))
         except Exception as e:
             logging.warning("exception checking account /u/{}: {}".format(user, e))
 
 
-def consider_action(post, link, banuser=True):
+def consider_action(caller, posts, banuser=True):
     global WHITELIST_CACHE
 
-    account = post.author
-    subreddit = post.subreddit
+    if isinstance(posts, list):
+        pass
+    elif isinstance(posts, set):
+        posts = sorted(posts, key=lambda x: x.created_utc, reverse=True)
+    else:
+        posts = [posts]
+
+    account = posts[0].author
+    subreddit = posts[0].subreddit
 
     if not member("moderated", subreddit):
         return False
@@ -448,10 +466,36 @@ def consider_action(post, link, banuser=True):
     if activity in WHITELIST_CACHE:
         return False
 
-    if post.banned_by == ME:
+    # verify that all posts are matching
+    if len(posts) > 1 and any(x.author != account or x.subreddit != subreddit for x in posts):
+        logging.error(f"non-matching posts: {', '.join([x.fullname for x in posts])}")
         return False
 
-    logging.info("subreddit hit /u/{} in /r/{}".format(account, subreddit))
+    # all posts already handled
+    if all(x.banned_by == ME for x in posts):
+        return False
+
+    logging.info(f"{caller} hit /u/{account} in /r/{subreddit}: {', '.join([x.fullname for x in posts])}")
+
+    try:
+        if re.search("proof\\b", str(posts[0].author_flair_css_class)):
+            logging.info("/u/{} is whitelisted via flair class in /r/{}".format(account, subreddit))
+            WHITELIST_CACHE[activity] = time.time()
+            return False
+    except Exception as e:
+        logging.error("error checking flair class, failing safe for /u/{} in /r/{}: {}".format(account, subreddit, e))
+        return False
+
+    try:
+        if any(x.distinguished for x in posts) or subreddit.moderator(account):
+            logging.info("/u/{} is whitelisted via moderator list in /r/{}".format(account, subreddit))
+            WHITELIST_CACHE[activity] = time.time()
+            return False
+    except Exception as e:
+        # fail safe
+        logging.error("error checking moderator list, failing safe for /u/{} in /r/{}: {}".format(account, subreddit, e))
+        return False
+
     permissions = []
     try:
         permissions = subreddit.moderator(ME)[0].mod_permissions
@@ -459,21 +503,6 @@ def consider_action(post, link, banuser=True):
             permissions.append("none")
     except Exception as e:
         logging.error("error checking moderator permissions in /r/{}: {}".format(subreddit, e))
-
-    if is_friend(account):
-        logging.info("/u/{} confirmed to be on friends list".format(account))
-    else:
-        logging.warning("/u/{} is not on friends list".format(account))
-        return False
-
-    try:
-        if re.search("proof\\b", str(post.author_flair_css_class)):
-            logging.info("/u/{} is whitelisted via flair class in /r/{}".format(account, subreddit))
-            WHITELIST_CACHE[activity] = time.time()
-            return False
-    except Exception as e:
-        logging.error("error checking flair class, failing safe for /u/{} in /r/{}: {}".format(account, subreddit, e))
-        return False
 
     try:
         if (not permissions or "access" in permissions or "all" in permissions) and subreddit.subreddit_type != "user":
@@ -485,35 +514,33 @@ def consider_action(post, link, banuser=True):
         logging.error("error checking approved users, failing safe for /u/{} in /r/{}: {}".format(account, subreddit, e))
         return False
 
-    try:
-        if subreddit.moderator(account):
-            logging.info("/u/{} is whitelisted via moderator list in /r/{}".format(account, subreddit))
-            WHITELIST_CACHE[activity] = time.time()
-            return False
-    except Exception as e:
-        # fail safe
-        logging.error("error checking moderator list, failing safe for /u/{} in /r/{}: {}".format(account, subreddit, e))
+    if is_friend(account):
+        logging.info("/u/{} confirmed to be on friends list".format(account))
+    else:
+        logging.warning("/u/{} is not on friends list".format(account))
         return False
 
     if banuser and ("access" in permissions or "all" in permissions):
-        ban(account, subreddit, link, ("mail" in permissions))
+        ban(account, subreddit, short_link(posts[0]), ("mail" in permissions))
 
-    if getattr(post, "removed", None) or getattr(post, "spam", None):
-        return True
+    for post in posts:
+        if getattr(post, "removed", None) or getattr(post, "spam", None):
+            continue
+        delay = int(time.time() - post.created_utc)
+        link = short_link(post)
+        if "posts" in permissions or "all" in permissions:
+            try:
+                logging.info("removing {} by /u/{} after {} seconds".format(link, account, delay))
+                post.mod.remove(spam=True)
+            except Exception as e:
+                logging.error("error removing {}: {}".format(link, e))
+        elif permissions:
+            try:
+                logging.info("reporting {} by /u/{} after {} seconds".format(link, account, delay))
+                post.report(option(HOME, "report_reason"))
+            except Exception as e:
+                logging.error("error reporting {}: {}".format(link, e))
 
-    delay = int(time.time() - post.created_utc)
-    if "posts" in permissions or "all" in permissions:
-        try:
-            logging.info("removing {} by /u/{} after {} seconds".format(link, account, delay))
-            post.mod.remove(spam=True)
-        except Exception as e:
-            logging.error("error removing {}: {}".format(link, e))
-    elif permissions:
-        try:
-            logging.info("reporting {} by /u/{} after {} seconds".format(link, account, delay))
-            post.report(option(HOME, "report_reason"))
-        except Exception as e:
-            logging.error("error reporting {}: {}".format(link, e))
     return True
 
 
@@ -608,6 +635,7 @@ def ban(account, subreddit, link, mail):
 
 
 def unban(account, subreddit):
+    subreddit = r.subreddit(subreddit)
     try:
         for ban in subreddit.banned(account):
             try:
@@ -617,7 +645,7 @@ def unban(account, subreddit):
                 else:
                     logging.debug("not unbanning /u/{} on /r/{} ({})".format(account, subreddit, ban.note or "[empty]"))
             except Exception as e:
-                logging.error("exception unbanning /u/{} on /r/{}".format(account, subreddit))
+                logging.error("exception unbanning /u/{} on /r/{}: {}".format(account, subreddit, e))
     except prawcore.exceptions.Forbidden as e:
         logging.debug("unable to check ban for /u/{} in /r/{}: {}".format(account, subreddit, e))
     except Exception as e:
@@ -772,8 +800,7 @@ def check_contributions():
 
         if submission.author in FRIEND_LIST:
             logging.info("contribution from friend /u/{}".format(submission.author))
-            link = "https://www.reddit.com/comments/{}".format(submission.id)
-            if consider_action(submission, link):
+            if consider_action("check_contributions", submission):
                 continue
 
         # require account
@@ -1320,6 +1347,7 @@ def check_state():
     global LOG_CACHE
     global NOTE_FAILURE_CACHE
     global NOTE_UNLOCKED_CACHE
+    global SUBMISSION_CACHE
     global WHITELIST_CACHE
 
     logging.info("checking state")
@@ -1359,7 +1387,7 @@ def check_state():
         if not UNBAN_STATE:
             for flair in HOME.flair():
                 if flair.get("user") and flair.get("flair_css_class") == "unban":
-                    subreddits = list(r.user.me().moderated())
+                    subreddits = list(map(str, r.user.me().moderated()))
                     if not subreddits:
                         raise RuntimeError("empty subreddit list")
                     UNBAN_STATE[flair.get("user")] = subreddits
@@ -1375,7 +1403,8 @@ def check_state():
     expire_cache(LOG_CACHE, 86400)
     expire_cache(NOTE_FAILURE_CACHE, 3600)
     expire_cache(NOTE_UNLOCKED_CACHE, 28800)
-    expire_cache(WHITELIST_CACHE, 3600)
+    expire_cache(SUBMISSION_CACHE, 3600)
+    expire_cache(WHITELIST_CACHE, 86400)
 
 
 def sync_submission(submission):
