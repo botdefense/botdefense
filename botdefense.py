@@ -330,11 +330,12 @@ def check_comments():
                 if comment.created_utc <= time.time() - 3600:
                     break
                 if member("moderated", comment.subreddit):
-                    if comment.subreddit not in entries:
-                        entries[comment.subreddit] = []
-                    entries[comment.subreddit].append(comment)
+                    group = (str(comment.author), str(comment.subreddit))
+                    if group not in entries:
+                        entries[group] = []
+                    entries[group].append(comment)
                     COMMENT_CACHE[comment.id] = comment.created_utc
-        for subreddit, comments in entries.items():
+        for comments in entries.values():
             consider_action("check_comments", comments)
     except Exception as e:
         logging.error("exception checking comments: {}".format(e))
