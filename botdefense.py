@@ -64,7 +64,7 @@ CONFIGURATION_DEFAULT = {
 # setup logging
 class LengthFilter(logging.Filter):
     def filter(self, record):
-        if record.funcName == '_do_retry' and record.msg.endswith('/about/modqueue/'):
+        if record.funcName == '_do_retry' and re.search(r'/about/(log|modqueue)/$', record.msg):
             m = re.search(r'/r/([\w:-]+\+)+[\w:-]+/', record.msg)
             if m:
                 record.msg = record.msg.replace(m.group(0), f'/r/[{m.group(0).count("+") + 1} subreddits]/')
@@ -635,12 +635,13 @@ def ban(account, subreddit, link, mail):
         logging.error("error banning /u/{} in /r/{}: {}".format(account, subreddit, e))
 
 
-def unban(account, subreddit):
-    subreddit = r.subreddit(subreddit)
+def unban(account, subreddit, description=None):
+    if isinstance(subreddit, str):
+        subreddit = r.subreddit(subreddit)
     try:
         for ban in subreddit.banned(account):
             try:
-                if ban.note and re.search(ME, ban.note):
+                if ban.note and (ban.note == description or ME in ban.note):
                     logging.info("unbanning /u/{} on /r/{} ({})".format(account, subreddit, ban.note))
                     subreddit.banned.remove(account)
                 else:
@@ -1391,7 +1392,8 @@ def check_state():
                     subreddits = list(map(str, r.user.me().moderated()))
                     if not subreddits:
                         raise RuntimeError("empty subreddit list")
-                    UNBAN_STATE[flair.get("user")] = subreddits
+                    canonical = find_canonical(str(flair["user"]))
+                    UNBAN_STATE[(flair["user"], canonical.created_utc if canonical else 0)] = subreddits
                     schedule(check_unbans, schedule=15, when="next")
         # this is like a free kill_switch check
         schedule(kill_switch, when="defer")
@@ -1478,15 +1480,35 @@ def check_unbans():
     if not UNBAN_STATE:
         return
     try:
+        current = next(iter(UNBAN_STATE))
+        account, submitted = current
+        logging.info("processing unban for /u/{} ({} subreddits remaining)".format(account, len(UNBAN_STATE[current])))
+        # fast method
+        try:
+            if UNBAN_STATE[current] and submitted > time.time() - 7776000:
+                query = random_subreddits(UNBAN_STATE[current])
+                done = set()
+                for log in r.subreddit(query).mod.log(action="banuser", mod=ME, limit=None):
+                    if log.mod == ME and log.target_author == account and log.subreddit not in done:
+                        unban(account, log.subreddit, description=log.description)
+                        done.add(log.subreddit)
+                    if log.created_utc < submitted:
+                        break
+                for subreddit in query.split("+"):
+                    UNBAN_STATE[current].remove(subreddit)
+                if UNBAN_STATE[current]:
+                    return
+        except Exception as e:
+            logging.error("exception checking logs: {}".format(e))
+        # slow method
         pause = time.time() + 10
-        account = next(iter(UNBAN_STATE))
-        logging.info("processing unban for /u/{} ({} subreddits remaining)".format(account, len(UNBAN_STATE[account])))
-        while UNBAN_STATE[account] and time.time() < pause:
-            unban(account, UNBAN_STATE[account].pop(0))
-        if not UNBAN_STATE[account]:
+        while UNBAN_STATE[current] and time.time() < pause:
+            unban(account, UNBAN_STATE[current].pop(0))
+        # delete if finished
+        if not UNBAN_STATE[current]:
             logging.info("finished unban for /u/{}".format(account))
             HOME.flair.delete(account)
-            del UNBAN_STATE[account]
+            del UNBAN_STATE[current]
             if not UNBAN_STATE:
                 schedule(check_unbans, schedule=86400, when="defer")
     except Exception as e:
