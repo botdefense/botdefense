@@ -361,26 +361,36 @@ def check_submissions():
 
 
 def check_queue():
+    global SUBMISSION_CACHE
+
     logging.info("checking queue")
     try:
-        # primary query
+        # modqueue query
         subreddits = SUBREDDITS.get("moderated", set())
         total_subreddits = len(subreddits)
         exclusions = option(HOME, "modqueue_exclusions", [])
         if exclusions:
             subreddits = subreddits.difference(exclusions)
-        queries = [random_subreddits(list(subreddits))]
-        # separately query excluded subreddits
-        for exclusion in exclusions:
-            if total_subreddits and random.random() < 500 / total_subreddits:
-                queries.append(exclusion)
-        for query in queries:
-            if not query:
+        query = random_subreddits(list(subreddits))
+        for submission in r.subreddit(query).mod.modqueue(limit=100, only="submissions"):
+            if submission.id in SUBMISSION_CACHE:
                 continue
-            limit = 5 if query in exclusions else 100
-            for submission in r.subreddit(query).mod.modqueue(limit=limit, only="submissions"):
-                if submission.author in FRIEND_LIST:
-                    consider_action("check_queue", submission)
+            if submission.author in FRIEND_LIST:
+                consider_action("check_queue", submission)
+                SUBMISSION_CACHE[submission.id] = submission.created_utc
+        # excluded subreddits
+        if random.random() < 500 / total_subreddits:
+            query = random_subreddits(exclusions)
+            for log in r.subreddit(query).mod.log(limit=500):
+                if not log.target_fullname or not log.target_fullname.startswith("t3_"):
+                    continue
+                if log.target_fullname[3:] in SUBMISSION_CACHE:
+                    continue
+                if log.created_utc <= time.time() - 3600:
+                    break
+                if r.redditor(log.target_author) in FRIEND_LIST:
+                    consider_action("check_queue", r.submission(log.target_fullname[3:]))
+                    SUBMISSION_CACHE[log.target_fullname[3:]] = log.created_utc
     except prawcore.exceptions.Forbidden as e:
         # probably removed from a subreddit
         logging.warning("exception checking queue: {}".format(e))
@@ -961,7 +971,7 @@ def check_notes():
         for log in r.get(path=f"/user/{ME}/m/contributions/about/log/", params={"limit": 500, "type": "lock"}):
             if log.created_utc < time.time() - 28800:
                 break
-            if log.created_utc > time.time() - 120 or log.target_author == ME:
+            if log.created_utc > time.time() - 180 or log.target_author == ME:
                 continue
             if not log.target_fullname or not log.target_fullname.startswith("t1_"):
                 continue
@@ -970,8 +980,9 @@ def check_notes():
                 locked[log.target_fullname] = max(log.created_utc, locked.get(log.target_fullname, 0))
         for comment in r.info(fullnames=locked.keys()):
             if comment.locked:
-                # unlock old comments
-                if comment.created_utc < time.time() - 21600:
+                # unlock persistent failures
+                last_update = max(comment.created_utc, comment.edited or 0)
+                if last_update < time.time() - 21600:
                     logging.warning("unable to create note for {}".format(comment.permalink))
                     comment.mod.unlock()
                     if comment.fullname in locked:
@@ -1038,16 +1049,36 @@ def check_notes():
 
             # process note
             attribution = "Note from /u/{} at {}".format(comment.author, comment.permalink)
-            logging.info("creating note for {} on {}".format(comment.permalink, post.permalink))
             try:
-                post.reply(body="{}:\n\n---\n\n{}".format(attribution, comment.body))
+                text = "{}:\n\n---\n\n{}".format(attribution, comment.body)
+                edit = None
+                existing_text = set()
+                try:
+                    if comment.edited and post.num_comments:
+                        for existing in post.comments.list():
+                            if existing.author != ME or not existing.body.startswith(attribution):
+                                continue
+                            if not edit or existing.created_utc > edit.created_utc:
+                                edit = existing
+                            existing_text.add(hash(existing.body))
+                except Exception as e:
+                    logging.warning("exception checking notes on {}: {}".format(post.permalink, e))
+                if hash(text) not in existing_text:
+                    if edit and len(text) > len(edit.body) / 2:
+                        logging.info("editing note for {} at {}".format(comment.permalink, edit.permalink))
+                        edit.edit(body=text)
+                    else:
+                        logging.info("creating note for {} on {}".format(comment.permalink, post.permalink))
+                        post.reply(body=text)
                 comment.mod.unlock()
                 if comment.fullname in locked:
                     NOTE_UNLOCKED_CACHE[comment.fullname] = locked[comment.fullname]
             except praw.exceptions.RedditAPIException as e:
                 logging.warning("exception creating note for {}, trying again with short note: {}".format(comment.permalink, e))
                 try:
-                    post.reply(body="{}.".format(attribution))
+                    text = "{}.".format(attribution)
+                    if hash(text) not in existing_text:
+                        post.reply(body=text)
                     comment.mod.unlock()
                     if comment.fullname in locked:
                         NOTE_UNLOCKED_CACHE[comment.fullname] = locked[comment.fullname]
