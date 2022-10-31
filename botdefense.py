@@ -634,6 +634,14 @@ def ban(account, subreddit, link, mail):
                 message, message_log = group_message, group
             if group_note:
                 note, note_log = group_note, group
+        if isinstance(message, list):
+            message = random.choice(message)
+        if not isinstance(message, str):
+            logging.error("ban message configuration error")
+            message = "Bots and bot-like accounts are not welcome on /r/{subreddit}."
+        if not isinstance(note, str):
+            logging.error("ban note configuration error")
+            note = "/u/{account} banned by /u/{me} at {date} for {reason}"
         message = message.format(subreddit=subreddit, home=HOME, account=account)
         note = note.format(account=account, me=ME, date=date, reason=link)
         subreddit.banned.add(account, ban_message=message, note=note)
@@ -980,10 +988,15 @@ def check_notes():
                 locked[log.target_fullname] = max(log.created_utc, locked.get(log.target_fullname, 0))
         for comment in r.info(fullnames=locked.keys()):
             if comment.locked:
-                # unlock persistent failures
+                # failure cases
+                failure = None
                 last_update = max(comment.created_utc, comment.edited or 0)
                 if last_update < time.time() - 21600:
-                    logging.warning("unable to create note for {}".format(comment.permalink))
+                    failure = "persistent failure"
+                elif comment.body == "[deleted]":
+                    failure = "deleted comment"
+                if failure:
+                    logging.warning(f"unable to create note for {comment.permalink} ({failure})")
                     comment.mod.unlock()
                     if comment.fullname in locked:
                         NOTE_UNLOCKED_CACHE[comment.fullname] = locked[comment.fullname]
