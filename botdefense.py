@@ -941,15 +941,31 @@ def check_contributions():
             note_post = process_contribution(submission, "accepted", note="for {}".format(name), reply=reply, crosspost=post)
             if report_text and note_post:
                 report_text += f" (https://redd.it/{note_post.id})"
+            report_found = False
             for attempt in range(3):
                 try:
                     post.report(report_text)
+                    time.sleep(attempt)
+                    check = r.submission(post.id)
+                    for report_name in ["mod_reports", "mod_reports_dismissed"]:
+                        value = getattr(check, report_name, None)
+                        if value:
+                            for report, moderator in value:
+                                if moderator == ME:
+                                    report_found = True
+                    if report_found:
+                        break
+                    logging.warning("report not found on {}".format(post.permalink))
+                except Exception as e:
+                    logging.error("exception reporting canonical post: {}".format(e))
+            for attempt in range(3):
+                try:
                     if report_type != "Reviewable":
                         sync_submission(post)
                         post.mod.approve()
                     break
                 except Exception as e:
-                    logging.error("exception reporting canonical post: {}".format(e))
+                    logging.error("exception approving canonical post: {}".format(e))
         elif canonical:
             reply = ("Thank you for your submission! It looks like we already have"
                      " an [entry for this account]({}).".format(canonical.permalink))
