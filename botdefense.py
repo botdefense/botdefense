@@ -18,6 +18,7 @@ import yaml
 STATUS_POST = None
 FRIEND_LIST = set()
 INACTIVE_LIST = set()
+MODERATORS = []
 SUBREDDITS = {}
 COMMENT_AFTER = None
 COMMENT_CACHE = {}
@@ -128,6 +129,8 @@ def member(name, element):
 
 
 def kill_switch():
+    global MODERATORS
+
     logging.info("checking kill switch")
     active = False
     counter = 0
@@ -135,15 +138,19 @@ def kill_switch():
     retries = 60
     while not active:
         try:
-            permissions = HOME.moderator(ME)[0].mod_permissions
-            if r.config.custom.get("node") == "primary" and "chat_operator" in permissions:
-                active = False
-            elif r.config.custom.get("node") == "secondary" and "chat_operator" not in permissions:
-                active = False
-                sleep = 600
-                retries = 144
-            elif permissions:
-                active = True
+            MODERATORS = list(HOME.moderator())
+            for moderator in MODERATORS:
+                if moderator.name != ME:
+                    continue
+                permissions = moderator.mod_permissions
+                if r.config.custom.get("node") == "primary" and "chat_operator" in permissions:
+                    active = False
+                elif r.config.custom.get("node") == "secondary" and "chat_operator" not in permissions:
+                    active = False
+                    sleep = 600
+                    retries = 144
+                elif permissions:
+                    active = True
         except Exception as e:
             logging.error("exception checking permissions: {}".format(e))
         if not active:
@@ -747,9 +754,9 @@ def process_contribution(submission, result, note=None, reply=None, crosspost=No
                 except Exception as e:
                     logging.error("exception saving duplicates: {}".format(e))
             # make notes crosspost if needed
-            notes = option(HOME, "notes")
-            if notes:
-                subreddit = r.subreddit(notes)
+            notes_subreddit = option(HOME, "notes")
+            if notes_subreddit:
+                subreddit = r.subreddit(notes_subreddit)
                 # see if a notes post already exists
                 for post in duplicates:
                     if post.subreddit == subreddit and not post.removed_by_category and not post.archived and post.title == crosspost.title and post.author == ME:
@@ -785,7 +792,6 @@ def check_contributions():
 
     # process oldest submissions first
     submissions = []
-    moderators = []
     try:
         # check submissions
         newest = None
@@ -795,12 +801,10 @@ def check_contributions():
             if submission.created_utc < CONTRIBUTION_LIMIT or submission.created_utc < time.time() - 86400:
                 break
             if submission.author != ME:
-                # fetch moderator list once
-                if not moderators:
-                    moderators = list(map(str, HOME.moderator()))
                 # allow time for submission statement
-                if submission.author in moderators or submission.created_utc < time.time() - 60 or (submission.num_comments and len(submission.comments)):
-                    submissions.insert(0, submission)
+                if submission.author not in MODERATORS and submission.link_flair_text and submission.link_flair_text != "contribution" and not submission.selftext and not submission.num_comments and submission.created_utc > time.time() - 60:
+                    continue
+                submissions.insert(0, submission)
         # set future limit
         if submissions:
             CONTRIBUTION_LIMIT = submissions[0].created_utc - 600
@@ -848,7 +852,7 @@ def check_contributions():
             logging.error("exception setting flair: {}".format(e))
 
         # wait for flair unless exempted
-        if not (submission.link_flair_text or submission.author in moderators or submission.subreddit.subreddit_type == "private"):
+        if not (submission.link_flair_text or submission.author in MODERATORS or submission.subreddit.subreddit_type == "private"):
             continue
 
         blocked = None
@@ -857,7 +861,7 @@ def check_contributions():
             user = r.redditor(account)
             if getattr(user, "is_employee", None):
                 blocked = ("admin", "an admin", "an admin")
-            elif user in moderators:
+            elif user in MODERATORS:
                 blocked = ("moderator", "a moderator", "a moderator")
             elif user == submission.author:
                 blocked = ("submitter", "your own", "their own")
@@ -874,7 +878,7 @@ def check_contributions():
 
         if blocked:
             process_contribution(submission, "blocked", note=f"({blocked[0]} account)")
-            if submission.author not in moderators:
+            if submission.author not in MODERATORS:
                 HOME.banned.add(submission.author,
                                 ban_message=f"Submitting {blocked[1]} account is not allowed.",
                                 note=f"submitted {blocked[2]} account {submission.permalink}")
@@ -910,8 +914,8 @@ def check_contributions():
                     m = re.search("^contribution-(\w+)$", submission.link_flair_text)
                     if m:
                         # assign flair for moderators and flaired users providing a submission statement
-                        assign_flair = submission.author in moderators
-                        if not assign_flair and submission.num_comments and len(submission.comments) and submission.comments[0].author == submission.author:
+                        assign_flair = submission.author in MODERATORS
+                        if not assign_flair and (submission.selftext or (submission.num_comments and len(submission.comments) and submission.comments[0].author == submission.author)):
                             user_flair = next(submission.subreddit.flair(submission.author))
                             if user_flair.get("user") == submission.author and user_flair.get("flair_css_class"):
                                 assign_flair = True
@@ -984,137 +988,160 @@ def check_notes():
     global NOTE_UNLOCKED_CACHE
 
     logging.info("checking for notes")
-    notes = option(HOME, "notes")
-    if not notes:
+    notes_subreddit = option(HOME, "notes")
+    if not notes_subreddit:
         return
 
-    # find locked comments
+    # find locked posts
     locked = {}
-    comments = []
+    posts = set()
     try:
         for log in r.get(path=f"/user/{ME}/m/contributions/about/log/", params={"limit": 500, "type": "lock"}):
             if log.created_utc < time.time() - 28800:
                 break
             if log.created_utc > time.time() - 180 or log.target_author == ME:
                 continue
-            if not log.target_fullname or not log.target_fullname.startswith("t1_"):
+            if not log.target_fullname:
                 continue
-            # comments to process
+            # posts to process
             if log.created_utc > NOTE_UNLOCKED_CACHE.get(log.target_fullname, 0):
                 locked[log.target_fullname] = max(log.created_utc, locked.get(log.target_fullname, 0))
-        for comment in r.info(fullnames=locked.keys()):
-            if comment.locked:
+        for post in r.info(fullnames=locked.keys()):
+            if post.locked:
                 # failure cases
                 failure = None
-                last_update = max(comment.created_utc, comment.edited or 0)
+                last_update = max(post.created_utc, post.edited or 0, locked.get(post.fullname, 0))
                 if last_update < time.time() - 21600:
                     failure = "persistent failure"
-                elif comment.body == "[deleted]":
-                    failure = "deleted comment"
+                elif isinstance(post, praw.models.reddit.comment.Comment):
+                    if post.body == "[deleted]":
+                        failure = "deleted comment"
+                    elif not post.body:
+                        failure = "empty comment"
+                elif isinstance(post, praw.models.reddit.submission.Submission):
+                    if post.removed_by_category == "deleted":
+                        failure = "deleted submission"
+                    elif not post.selftext:
+                        failure = "empty submission"
                 if failure:
-                    logging.warning(f"unable to create note for {comment.permalink} ({failure})")
-                    comment.mod.unlock()
-                    if comment.fullname in locked:
-                        NOTE_UNLOCKED_CACHE[comment.fullname] = locked[comment.fullname]
-                # process recent comments
+                    logging.warning(f"unable to create note for {post.permalink} ({failure})")
+                    post.mod.unlock()
+                    if post.fullname in locked:
+                        NOTE_UNLOCKED_CACHE[post.fullname] = locked[post.fullname]
+                # process recent posts
                 else:
-                    comments.insert(0, comment)
-            elif comment.fullname in locked:
-                NOTE_UNLOCKED_CACHE[comment.fullname] = locked[comment.fullname]
-        if locked or comments:
-            logging.info(f"{len(locked)} locked targets, {len(comments)} locked comments")
-        if not comments:
+                    posts.add(post)
+            elif post.fullname in locked:
+                NOTE_UNLOCKED_CACHE[post.fullname] = locked[post.fullname]
+        if locked or posts:
+            logging.info(f"{len(locked)} locked targets, {len(posts)} locked posts")
+        if not posts:
             return
     except Exception as e:
-        logging.error("exception checking comments: {}".format(e))
+        logging.error("exception checking posts: {}".format(e))
 
-    # populate submissions
+    # populate submissions for comments
     try:
+        fullnames = set()
         submissions = {}
-        for info in r.info(fullnames=set(map(lambda x: x.link_id, comments))):
+        for post in posts:
+            if isinstance(post, praw.models.reddit.comment.Comment):
+                fullnames.add(post.link_id)
+        for info in r.info(fullnames=fullnames):
             submissions[info.fullname] = info
-        for comment in comments:
-            if submissions.get(comment.link_id):
-                comment.submission = submissions[comment.link_id]
+        for post in posts:
+            if isinstance(post, praw.models.reddit.comment.Comment) and submissions.get(post.link_id):
+                post.submission = submissions[post.link_id]
     except Exception as e:
         logging.error("exception populating submissions: {}".format(e))
 
-    # process comments for a limited period of time
+    # process posts for a limited period of time
     pause = time.time() + 60
     skipped = set()
-    # process oldest comments first
-    for comment in sorted(comments, key=lambda x: int(x.id, 36)):
+    # process oldest posts first
+    for post in sorted(posts, key=lambda x: (x.created_utc, int(x.id, 36))):
         if time.time() >= pause:
             break
 
         try:
-            account = account_name(comment.submission)
+            account = None
+            if isinstance(post, praw.models.reddit.comment.Comment):
+                account = account_name(post.submission)
+            elif isinstance(post, praw.models.reddit.submission.Submission):
+                account = account_name(post)
             if not account:
-                comment.mod.unlock()
-                if comment.fullname in locked:
-                    NOTE_UNLOCKED_CACHE[comment.fullname] = locked[comment.fullname]
+                post.mod.unlock()
+                if post.fullname in locked:
+                    NOTE_UNLOCKED_CACHE[post.fullname] = locked[post.fullname]
                 continue
 
             # comment made directly on notes post
-            if comment.submission.author == ME and comment.subreddit == notes and not comment.submission.removed_by_category:
-                comment.mod.unlock()
-                if comment.fullname in locked:
-                    NOTE_UNLOCKED_CACHE[comment.fullname] = locked[comment.fullname]
+            if isinstance(post, praw.models.reddit.comment.Comment) and post.submission.author == ME and post.subreddit == notes_subreddit and not post.submission.removed_by_category:
+                post.mod.unlock()
+                if post.fullname in locked:
+                    NOTE_UNLOCKED_CACHE[post.fullname] = locked[post.fullname]
                 continue
 
             # skip recent failures
             if account in NOTE_FAILURE_CACHE:
-                skipped.add(comment.id)
+                skipped.add(post.fullname)
                 continue
 
             # find notes post
-            post = find_canonical(account, subreddit=r.subreddit(notes))
+            notes = find_canonical(account, subreddit=r.subreddit(notes_subreddit))
 
             # skip comment if missing
-            if not post:
+            if not notes:
                 NOTE_FAILURE_CACHE[account] = time.time()
-                logging.warning("unable to find notes post for {}".format(comment.permalink))
+                logging.warning("unable to find notes post for {}".format(post.permalink))
                 continue
 
             # process note
-            attribution = "Note from /u/{} at {}".format(comment.author, comment.permalink)
+            attribution = "Note from /u/{} at {}".format(post.author, post.permalink)
             try:
-                text = "{}:\n\n---\n\n{}".format(attribution, comment.body)
+                text = f"{attribution}:\n\n---\n\n"
+                if isinstance(post, praw.models.reddit.comment.Comment):
+                    text += f"{post.body}"
+                elif isinstance(post, praw.models.reddit.submission.Submission):
+                    text += f"{post.selftext}"
                 edit = None
                 existing_text = set()
                 try:
-                    if comment.edited and post.num_comments:
-                        for existing in post.comments.list():
-                            if existing.author != ME or not existing.body.startswith(attribution):
+                    if post.edited and notes.num_comments:
+                        attribution_pattern = re.escape(attribution)
+                        for existing in notes.comments.list():
+                            if existing.author != ME:
+                                continue
+                            if not re.search(fr'^{attribution_pattern}[.:]', existing.body):
                                 continue
                             if not edit or existing.created_utc > edit.created_utc:
                                 edit = existing
                             existing_text.add(hash(existing.body))
                 except Exception as e:
-                    logging.warning("exception checking notes on {}: {}".format(post.permalink, e))
+                    logging.warning("exception checking notes on {}: {}".format(notes.permalink, e))
                 if hash(text) not in existing_text:
                     if edit and len(text) > len(edit.body) / 2:
-                        logging.info("editing note for {} at {}".format(comment.permalink, edit.permalink))
+                        logging.info("editing note for {} at {}".format(post.permalink, edit.permalink))
                         edit.edit(body=text)
                     else:
-                        logging.info("creating note for {} on {}".format(comment.permalink, post.permalink))
-                        post.reply(body=text)
-                comment.mod.unlock()
-                if comment.fullname in locked:
-                    NOTE_UNLOCKED_CACHE[comment.fullname] = locked[comment.fullname]
+                        logging.info("creating note for {} on {}".format(post.permalink, notes.permalink))
+                        notes.reply(body=text)
+                post.mod.unlock()
+                if post.fullname in locked:
+                    NOTE_UNLOCKED_CACHE[post.fullname] = locked[post.fullname]
             except praw.exceptions.RedditAPIException as e:
-                logging.warning("exception creating note for {}, trying again with short note: {}".format(comment.permalink, e))
+                logging.warning("exception creating note for {}, trying again with short note: {}".format(post.permalink, e))
                 try:
-                    text = "{}.".format(attribution)
+                    text = f"{attribution}."
                     if hash(text) not in existing_text:
-                        post.reply(body=text)
-                    comment.mod.unlock()
-                    if comment.fullname in locked:
-                        NOTE_UNLOCKED_CACHE[comment.fullname] = locked[comment.fullname]
+                        notes.reply(body=text)
+                    post.mod.unlock()
+                    if post.fullname in locked:
+                        NOTE_UNLOCKED_CACHE[post.fullname] = locked[post.fullname]
                 except Exception as e:
-                    logging.error("exception creating note for {}: {}".format(comment.permalink, e))
+                    logging.error("exception creating note for {}: {}".format(post.permalink, e))
             except Exception as e:
-                logging.error("exception creating note for {}: {}".format(comment.permalink, e))
+                logging.error("exception creating note for {}: {}".format(post.permalink, e))
         except Exception as e:
             logging.error("exception checking for notes: {}".format(e))
 
@@ -1446,15 +1473,22 @@ def check_state():
 
     # check for pending unbans
     try:
-        if not UNBAN_STATE:
+        if len(UNBAN_STATE) <= 1:
             for flair in HOME.flair():
                 if flair.get("user") and flair.get("flair_css_class") == "unban":
+                    found = False
+                    for account, submitted in UNBAN_STATE.keys():
+                        if account == flair["user"]:
+                            found = True
+                    if found:
+                        continue
                     subreddits = list(map(str, r.user.me().moderated()))
                     if not subreddits:
                         raise RuntimeError("empty subreddit list")
                     canonical = find_canonical(str(flair["user"]))
                     UNBAN_STATE[(flair["user"], canonical.created_utc if canonical else 0)] = subreddits
                     schedule(check_unbans, schedule=15, when="next")
+                    break
         # this is like a free kill_switch check
         schedule(kill_switch, when="defer")
     except Exception as e:
