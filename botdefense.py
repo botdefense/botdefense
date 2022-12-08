@@ -1104,12 +1104,15 @@ def check_notes():
                     text += f"{post.body}"
                 elif isinstance(post, praw.models.reddit.submission.Submission):
                     text += f"{post.selftext}"
+                # check existing notes
                 edit = None
                 existing_text = set()
                 try:
-                    if post.edited and notes.num_comments:
+                    if notes.num_comments:
                         attribution_pattern = re.escape(attribution)
                         for existing in notes.comments.list():
+                            if isinstance(existing, praw.models.MoreComments):
+                                continue
                             if existing.author != ME:
                                 continue
                             if not re.search(fr'^{attribution_pattern}[.:]', existing.body):
@@ -1119,13 +1122,14 @@ def check_notes():
                             existing_text.add(hash(existing.body))
                 except Exception as e:
                     logging.warning("exception checking notes on {}: {}".format(notes.permalink, e))
-                if hash(text) not in existing_text:
-                    if edit and len(text) > len(edit.body) / 2:
-                        logging.info("editing note for {} at {}".format(post.permalink, edit.permalink))
-                        edit.edit(body=text)
-                    else:
-                        logging.info("creating note for {} on {}".format(post.permalink, notes.permalink))
-                        notes.reply(body=text)
+                if hash(text) in existing_text:
+                    logging.info("existing note for {} on {}".format(post.permalink, notes.permalink))
+                elif edit and len(text) > len(edit.body) / 2:
+                    logging.info("editing note for {} at {}".format(post.permalink, edit.permalink))
+                    edit.edit(body=text)
+                else:
+                    logging.info("creating note for {} on {}".format(post.permalink, notes.permalink))
+                    notes.reply(body=text)
                 post.mod.unlock()
                 if post.fullname in locked:
                     NOTE_UNLOCKED_CACHE[post.fullname] = locked[post.fullname]
