@@ -1018,13 +1018,15 @@ def check_notes():
                         failure = "deleted comment"
                     elif not post.body:
                         failure = "empty comment"
+                    elif post.banned_by and isinstance(post.banned_by, str):
+                        failure = "moderator removed comment"
                 elif isinstance(post, praw.models.reddit.submission.Submission):
                     if post.removed_by_category == "deleted":
                         failure = "deleted submission"
                     elif not post.selftext:
                         failure = "empty submission"
                 if failure:
-                    logging.warning(f"unable to create note for {post.permalink} ({failure})")
+                    logging.warning(f"not creating note for {post.permalink} ({failure})")
                     post.mod.unlock()
                     if post.fullname in locked:
                         NOTE_UNLOCKED_CACHE[post.fullname] = locked[post.fullname]
@@ -1069,14 +1071,22 @@ def check_notes():
                 account = account_name(post.submission)
             elif isinstance(post, praw.models.reddit.submission.Submission):
                 account = account_name(post)
-            if not account:
-                post.mod.unlock()
-                if post.fullname in locked:
-                    NOTE_UNLOCKED_CACHE[post.fullname] = locked[post.fullname]
-                continue
 
+            # additional checks
+            unlock = False
+            # no account
+            if not account:
+                unlock = True
             # comment made directly on notes post
-            if isinstance(post, praw.models.reddit.comment.Comment) and post.submission.author == ME and post.subreddit == notes_subreddit and not post.submission.removed_by_category:
+            elif isinstance(post, praw.models.reddit.comment.Comment) and post.submission.author == ME and post.subreddit == notes_subreddit and not post.submission.removed_by_category:
+                unlock = True
+            # same account
+            elif post.author == account:
+                unlock = f"not creating note for {post.permalink} (same account)"
+            # unused posts
+            if unlock:
+                if isinstance(unlock, str):
+                    logging.warning(unlock)
                 post.mod.unlock()
                 if post.fullname in locked:
                     NOTE_UNLOCKED_CACHE[post.fullname] = locked[post.fullname]
