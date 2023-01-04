@@ -319,7 +319,7 @@ def load_subreddits():
     for multireddit in r.user.multireddits():
         name = re.sub(r'\d+', '', multireddit.name)
         multireddit.subreddits = set(map(str, multireddit.subreddits))
-        SUBREDDITS[name] = set.union(SUBREDDITS.get(name, set()), multireddit.subreddits)
+        SUBREDDITS[name] = SUBREDDITS.get(name, set()) | multireddit.subreddits
 
 
 def check_comments():
@@ -739,7 +739,7 @@ def process_contribution(submission, result, note=None, reply=None, crosspost=No
         if crosspost:
             duplicates = set(crosspost.duplicates())
             # multiple canonical check
-            canonicals = set({crosspost.permalink})
+            canonicals = {crosspost.permalink}
             for post in duplicates:
                 if post.subreddit == HOME and post.author == ME and not post.removed_by_category:
                     canonicals.add(post.permalink)
@@ -1171,7 +1171,7 @@ def check_duplicates():
         for iterator in HOME.new(limit=1000), HOME.search(f'author:{ME}', limit=250, sort='new'), r.user.me().saved(limit=1000):
             for post in iterator:
                 if post.author == ME and post.url and post.url.startswith("https://www.reddit.com/user/"):
-                    urls[post.url] = set.union(urls.get(post.url, set()), set([post.fullname]))
+                    urls[post.url] = urls.get(post.url, set()) | {post.fullname}
                 if post.saved:
                     post.unsave()
         references = None
@@ -1185,7 +1185,7 @@ def check_duplicates():
                 references = {}
                 for comment in r.redditor(ME).comments.new(limit=1000):
                     for match in re.findall(f'/r/{HOME}/comments/\w+/\w+/', comment.body):
-                        references[match] = set.union(references.get(match, set()), set([comment.id]))
+                        references[match] = references.get(match, set()) | {comment.id}
             # score each canonical post
             posts = sorted(r.info(fullnames=fullnames), key=lambda x: int(x.id, 36), reverse=True)
             scores = {}
@@ -1464,12 +1464,16 @@ def check_state():
                     continue
                 if log.created_utc <= time.time() - 86400:
                     break
+                if log.target_author != ME and action == "approvelink":
+                    approved = r.submission(log.target_fullname[3:])
+                    if not approved.removed_by_category and account_name(approved):
+                        logging.warning("unexpected contribution approval for {}".format(log.target_permalink))
+                        HOME.message(subject="Unexpected contribution approval", message="{}".format(log.target_permalink))
+                    LOG_CACHE[str(log.id)] = time.time()
+                    continue
                 if log.target_author != ME or not log.target_fullname.startswith("t3_"):
                     continue
-                if edited.get(log.target_fullname):
-                    edited[log.target_fullname].append(str(log.id))
-                else:
-                    edited[log.target_fullname] = [str(log.id)]
+                edited[log.target_fullname] = edited.get(log.target_fullname, set()) | {str(log.id)}
         for submission in r.info(fullnames=edited.keys()):
             try:
                 # skip removed and deleted submissions
