@@ -1,17 +1,17 @@
-#!/usr/bin/env python3.7
+#!/usr/bin/env python3
 
 import logging
 import os
+import praw
+import prawcore.exceptions
 import random
 import re
 import sys
 import time
+import yaml
+
 from copy import deepcopy
 from datetime import datetime
-
-import praw
-import prawcore.exceptions
-import yaml
 
 
 # global data
@@ -288,10 +288,10 @@ def load_configuration(subreddit=None):
     return options
 
 
-def random_subreddits(subreddits, length=6272, separator='+'):
+def random_subreddits(subreddits, length=6272, k=500, separator='+'):
     try:
-        # queue requests are limited to 500 subreddits
-        sample = separator.join(random.sample(subreddits, k=min(500, len(subreddits))))
+        # most requests are limited to 500 subreddits
+        sample = separator.join(random.sample(subreddits, k=min(k, len(subreddits))))
         # bad request errors start at 6358 bytes for queue requests with limit=100, only="submissions"
         if len(sample) > length:
             sample = sample[:sample.rindex(separator, 0, length+1)]
@@ -301,11 +301,19 @@ def random_subreddits(subreddits, length=6272, separator='+'):
         return None
 
 
-def load_subreddits():
-    global SUBREDDITS
+def filter_modmail():
+    if SUBREDDITS.get("mail") and SUBREDDITS.get("moderated"):
+        previous = len(SUBREDDITS["mail"])
+        SUBREDDITS["mail"].intersection_update(SUBREDDITS["moderated"])
+        current = len(SUBREDDITS["mail"])
+        if current < previous:
+            logging.info("removed {} unmoderated subreddits from modmail subreddits".format(previous - current))
 
+
+def load_subreddits():
     logging.info("loading subreddits")
-    SUBREDDITS = { "moderated": set(), "nsfw": set() }
+    SUBREDDITS["moderated"] = set()
+    SUBREDDITS["nsfw"] = set()
     start = time.time()
     for subreddit in r.user.me().moderated():
         SUBREDDITS["moderated"].add(str(subreddit))
@@ -314,12 +322,29 @@ def load_subreddits():
             SUBREDDITS["nsfw"].add(str(subreddit))
     if not SUBREDDITS.get("moderated"):
         raise RuntimeError("empty subreddit list")
+    filter_modmail()
     if elapsed >= 60:
         logging.warning("time limit exceeded")
     for multireddit in r.user.multireddits():
         name = re.sub(r'\d+', '', multireddit.name)
         multireddit.subreddits = set(map(str, multireddit.subreddits))
         SUBREDDITS[name] = SUBREDDITS.get(name, set()) | multireddit.subreddits
+
+
+def load_modmail():
+    logging.info("loading modmail")
+    SUBREDDITS["mail"] = set()
+    for attempt in range(5):
+        try:
+            for subreddit in r.subreddit("all").modmail.subreddits():
+                if not re.search(r'^u[/_]', str(subreddit)):
+                    SUBREDDITS["mail"].add(str(subreddit))
+            break
+        except Exception as e:
+            logging.warning("exception loading modmail subreddits: {}".format(e))
+    filter_modmail()
+    if not SUBREDDITS["mail"]:
+        logging.error("unable to load modmail subreddits")
 
 
 def check_comments():
@@ -367,41 +392,48 @@ def check_submissions():
         logging.error("exception checking submissions: {}".format(e))
 
 
-def check_queue():
+def check_log():
+    global COMMENT_CACHE
     global SUBMISSION_CACHE
 
-    logging.info("checking queue")
+    logging.info("checking log")
     try:
-        # modqueue query
-        subreddits = SUBREDDITS.get("moderated", set())
-        total_subreddits = len(subreddits)
-        exclusions = option(HOME, "modqueue_exclusions", [])
-        if exclusions:
-            subreddits = subreddits.difference(exclusions)
-        query = random_subreddits(list(subreddits))
-        for submission in r.subreddit(query).mod.modqueue(limit=100, only="submissions"):
-            if submission.id in SUBMISSION_CACHE:
+        query = random_subreddits(list(SUBREDDITS.get("moderated")))
+        fullnames = set()
+        for log in r.subreddit(query).mod.log(limit=500):
+            if not log.target_fullname or not re.search(r'^t[13]_', str(log.target_fullname)):
                 continue
-            if submission.author in FRIEND_LIST:
-                consider_action("check_queue", submission)
-                SUBMISSION_CACHE[submission.id] = submission.created_utc
-        # excluded subreddits
-        if random.random() < 500 / total_subreddits:
-            query = random_subreddits(exclusions)
-            for log in r.subreddit(query).mod.log(limit=500):
-                if not log.target_fullname or not log.target_fullname.startswith("t3_"):
+            if log.mod == ME:
+                continue
+            if log.target_fullname[3:] in COMMENT_CACHE or log.target_fullname[3:] in SUBMISSION_CACHE:
+                continue
+            if log.created_utc <= time.time() - 3600:
+                break
+            if r.redditor(log.target_author) in FRIEND_LIST:
+                fullnames.add(log.target_fullname)
+        if fullnames:
+            recent_activity_limit = option(HOME, "recent_activity_limit", 86400)
+            if not isinstance(recent_activity_limit, int):
+                recent_activity_limit = 86400
+            entries = {}
+            for post in r.info(fullnames=fullnames):
+                if post.created_utc <= time.time() - recent_activity_limit:
                     continue
-                if log.target_fullname[3:] in SUBMISSION_CACHE:
-                    continue
-                if log.created_utc <= time.time() - 3600:
-                    break
-                if r.redditor(log.target_author) in FRIEND_LIST:
-                    consider_action("check_queue", r.submission(log.target_fullname[3:]))
-                    SUBMISSION_CACHE[log.target_fullname[3:]] = log.created_utc
+                if post.author:
+                    group = (str(post.author), str(post.subreddit))
+                    if group not in entries:
+                        entries[group] = []
+                    entries[group].append(post)
+                if post.fullname.startswith("t1_"):
+                    COMMENT_CACHE[post.id] = time.time()
+                elif post.fullname.startswith("t3_"):
+                    SUBMISSION_CACHE[post.id] = time.time()
+            for posts in entries.values():
+                consider_action("check_log", posts)
     except prawcore.exceptions.Forbidden as e:
         # probably removed from a subreddit
-        logging.warning("exception checking queue: {}".format(e))
-        # schedule load_subreddits in case check_mail does not run it
+        logging.warning("exception checking log: {}".format(e))
+        # schedule reload just in case
         schedule(load_subreddits, when="next")
         check_mail()
         schedule(check_mail, when="defer")
@@ -409,7 +441,7 @@ def check_queue():
         error = str(e)
         if error.startswith("<html>"):
             error = error.replace("\n", "")
-        logging.error("exception checking queue: {}".format(error))
+        logging.error("exception checking log: {}".format(error))
 
 
 def check_accounts():
@@ -558,6 +590,15 @@ def consider_action(caller, posts, banuser=True):
                 post.report(option(HOME, "report_reason"))
             except Exception as e:
                 logging.error("error reporting {}: {}".format(link, e))
+
+    # consider updating modmail subreddits
+    if "mail" in permissions or "all" in permissions:
+        if not member("mail", subreddit) and not re.search(r'^u[/_]', str(subreddit)):
+            SUBREDDITS["mail"].add(str(subreddit))
+            logging.info("adding /r/{} to modmail subreddits".format(subreddit))
+    elif member("mail", subreddit):
+        SUBREDDITS["mail"].remove(str(subreddit))
+        logging.info("removing /r/{} from modmail subreddits".format(subreddit))
 
     return True
 
@@ -894,7 +935,7 @@ def check_contributions():
                             if moderator == "AutoModerator":
                                 logging.info("contribution {} from /u/{} reported for \"{}\"".format(submission.permalink, submission.author, report))
                                 approved = False
-            if not approved and submission.author.is_mod:
+            if not approved:
                 minimum = option(HOME, "contribution_minimum_subscribers")
                 if minimum:
                     moderated = submission.author.moderated()
@@ -1311,26 +1352,35 @@ def check_modmail():
     logging.info("checking modmail")
     thread = None
     try:
-        for thread in r.subreddit("all").modmail.conversations(limit=100):
-            modmail_id = ":".join([str(thread.id), str(thread.last_mod_update), str(thread.last_user_update)])
-            if modmail_id in MODMAIL_IDS:
-                continue
-            MODMAIL_IDS.append(modmail_id)
-            account = None
+        query = random_subreddits(list(SUBREDDITS["mail"]), k=250, separator=',')
+        threads = []
+        try:
+            for iterator in HOME.modmail.conversations(limit=50), r.subreddit(query).modmail.conversations(limit=50):
+                for thread in iterator:
+                    account = None
+                    try:
+                        account = thread.participant if thread.participant else thread.user
+                    except:
+                        continue
+                    if not account or account not in FRIEND_LIST:
+                        continue
+                    if thread.id in MODMAIL_IDS:
+                        continue
+                    MODMAIL_IDS.append(thread.id)
+                    threads.append((account, thread))
+        except prawcore.exceptions.Forbidden as e:
+            # removed from a subreddit or permissions changed
+            logging.warning("exception checking modmail: {}".format(e))
+            schedule(check_mail, when="next")
+            schedule(load_modmail, when="next")
+        except Exception as e:
+            logging.warning("exception checking modmail: {}".format(e))
+        for account, thread in threads:
             banned = False
             # fastest checks
             if thread.is_auto and thread.num_messages == 1:
                 continue
             if thread.is_internal or not thread.is_repliable:
-                continue
-            try:
-                if thread.participant:
-                    account = thread.participant
-                else:
-                    account = thread.user
-            except:
-                continue
-            if not account or account not in FRIEND_LIST:
                 continue
             # handled check
             if ME in thread.authors:
@@ -1633,16 +1683,17 @@ if __name__ == "__main__":
         check_comments: 5,
         check_contributions: 60,
         check_duplicates: 3600,
+        check_log: 20,
         check_mail: 120,
         check_modmail: 30,
         check_notes: 120,
-        check_queue: 20,
         check_state: 300,
         check_submissions: 30,
         check_unbans: 86400,
         kill_switch: 120,
         load_configuration: 3600,
         load_flair: 86400,
+        load_modmail: 86400,
         load_subreddits: 86400,
         update_status: 900,
     }
@@ -1653,6 +1704,7 @@ if __name__ == "__main__":
         schedule(kill_switch, when="next")
         schedule(load_configuration, when="next")
         schedule(load_flair, when="next")
+        schedule(load_modmail, when="next")
         schedule(load_subreddits, when="next")
         while True:
             run()
