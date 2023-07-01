@@ -87,6 +87,7 @@ try:
     ME = str(r.user.me())
     HOME = r.subreddit(ME)
     SCAN = r.subreddit(r.config.custom.get("scan", "all"))
+    START = time.time()
 except IndexError:
     logging.error("usage: {} <praw.ini section>".format(sys.argv[0]))
     sys.exit(1)
@@ -1052,7 +1053,7 @@ def check_notes():
                 # failure cases
                 failure = None
                 last_update = max(post.created_utc, post.edited or 0, locked.get(post.fullname, 0))
-                if last_update < time.time() - 21600:
+                if last_update < time.time() - 21600 and START < time.time() - 10800:
                     failure = "persistent failure"
                 elif isinstance(post, praw.models.reddit.comment.Comment):
                     if post.body == "[deleted]":
